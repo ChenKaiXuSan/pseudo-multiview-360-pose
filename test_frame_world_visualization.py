@@ -16,6 +16,7 @@ from sam3d_body_multiview_fusion import (
     collect_frame_world_tracks,
     save_frame_tracks_world_visualization,
     track_color_rgb01,
+    world_keypoints_to_equirectangular_pixels,
 )
 
 
@@ -45,6 +46,20 @@ def test_collect_frame_world_tracks_reads_sorted_tracks() -> None:
 
     assert [track["track_id"] for track in tracks] == [1, 2]
     assert tracks[0]["keypoints"].shape == (3, 4)
+
+
+def test_world_keypoints_project_to_equirectangular_pixels() -> None:
+    kpts = np.array([
+        [0.0, 0.0, 1.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+    pixels = world_keypoints_to_equirectangular_pixels(kpts, width=400, height=200)
+
+    assert np.allclose(pixels[0], [200.0, 100.0])
+    assert np.allclose(pixels[1], [300.0, 100.0])
+    assert np.allclose(pixels[2], [200.0, 0.0])
 
 
 def test_save_frame_tracks_world_visualization_writes_png() -> None:
@@ -104,7 +119,7 @@ def test_visualization_writes_metadata_and_uses_stable_track_colors() -> None:
     assert not np.allclose(track_color_rgb01(1), track_color_rgb01(5))
     assert metadata["frame_title"] == "frame 000092 original 360"
     assert metadata["tracks"] == [1, 5]
-    assert metadata["plot_views"] == ["original_360", "world_3d", "world_xz_topdown"]
+    assert metadata["plot_views"] == ["original_360_with_kpts", "world_3d", "world_xz_topdown"]
     assert len(metadata["source_files"]) == 2
 
 
@@ -139,6 +154,7 @@ def test_verbose_frame_visualization_reports_progress() -> None:
 
 if __name__ == "__main__":
     test_collect_frame_world_tracks_reads_sorted_tracks()
+    test_world_keypoints_project_to_equirectangular_pixels()
     test_save_frame_tracks_world_visualization_writes_png()
     test_visualization_writes_metadata_and_uses_stable_track_colors()
     test_verbose_frame_visualization_reports_progress()

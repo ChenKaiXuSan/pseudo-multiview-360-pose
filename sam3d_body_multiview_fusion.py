@@ -813,6 +813,7 @@ def collect_frame_world_tracks(frame_dir: Path, min_conf: float = 0.0, verbose: 
         tracks.append({
             "track_id": track_id,
             "keypoints": kpts,
+            "source_bbox_xyxy": payload.get("source_bbox_xyxy"),
             "result_path": normalize_command_path(result_path),
         })
         if verbose:
@@ -821,6 +822,70 @@ def collect_frame_world_tracks(frame_dir: Path, min_conf: float = 0.0, verbose: 
     if verbose:
         log_progress("frame-vis", f"collected {len(tracks)} valid tracks")
     return tracks
+
+
+def world_keypoints_to_equirectangular_pixels(kpts: np.ndarray, width: int, height: int) -> np.ndarray:
+    xyz = np.asarray(kpts[:, :3], dtype=np.float64)
+    pixels = np.full((len(xyz), 2), np.nan, dtype=np.float64)
+    finite = np.isfinite(xyz).all(axis=1)
+    radius = np.linalg.norm(xyz, axis=1)
+    valid = finite & (radius > 1e-9)
+    if not np.any(valid):
+        return pixels
+    lon = np.arctan2(xyz[valid, 0], xyz[valid, 2])
+    lat = np.arcsin(np.clip(xyz[valid, 1] / radius[valid], -1.0, 1.0))
+    pixels[valid, 0] = (lon / (2.0 * math.pi) + 0.5) * float(width)
+    pixels[valid, 1] = (0.5 - lat / math.pi) * float(height)
+    return pixels
+
+
+def draw_frame_tracks_overlay(
+    ax,
+    tracks: list[dict[str, Any]],
+    edges: list[tuple[int, int]],
+    width: int,
+    height: int,
+    min_conf: float,
+) -> None:
+    from matplotlib import patches
+
+    for track in tracks:
+        kpts = np.asarray(track["keypoints"], dtype=np.float64)
+        mask = finite_keypoint_mask(kpts, min_conf)
+        if not np.any(mask):
+            continue
+        pixels = world_keypoints_to_equirectangular_pixels(kpts, width, height)
+        pixel_mask = mask & np.isfinite(pixels).all(axis=1)
+        if not np.any(pixel_mask):
+            continue
+        track_id = int(track["track_id"])
+        color = track_color_rgb01(track_id)
+        pts = pixels[pixel_mask]
+        ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=16, edgecolors="white", linewidths=0.4, alpha=0.95)
+        for a, b in edges:
+            if a < len(kpts) and b < len(kpts) and pixel_mask[a] and pixel_mask[b]:
+                seg = pixels[[a, b], :2]
+                if abs(seg[0, 0] - seg[1, 0]) > width * 0.5:
+                    continue
+                ax.plot(seg[:, 0], seg[:, 1], color=color, linewidth=1.2, alpha=0.9)
+        bbox = track.get("source_bbox_xyxy")
+        if bbox and len(bbox) == 4:
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+            label_x = min(max(x1, 0.0), max(width - 1.0, 0.0))
+            label_y = min(max(y1 - 8.0, 14.0), max(height - 1.0, 14.0))
+            rect = patches.Rectangle((x1, y1), max(x2 - x1, 1.0), max(y2 - y1, 1.0), fill=False, color=color, linewidth=1.4, alpha=0.9)
+            ax.add_patch(rect)
+        else:
+            label_x = float(np.nanmedian(pts[:, 0]))
+            label_y = float(np.nanmin(pts[:, 1]))
+        ax.text(
+            label_x,
+            label_y,
+            f"track_{track_id:04d}",
+            fontsize=8,
+            color="white",
+            bbox={"facecolor": color, "edgecolor": "white", "alpha": 0.82, "pad": 2.0},
+        )
 
 
 def draw_frame_tracks_world_axis(
@@ -927,8 +992,10 @@ def write_frame_tracks_metadata(
         "frame_title": frame_title or "original 360 frame",
         "tracks": [int(track["track_id"]) for track in tracks],
         "source_files": [track.get("result_path", "") for track in tracks],
+        "source_bboxes_xyxy": [track.get("source_bbox_xyxy") for track in tracks],
+        "overlay": {"keypoints": "world_to_equirectangular_projection", "track_ids": True},
         "min_conf": float(min_conf),
-        "plot_views": ["original_360", "world_3d", "world_xz_topdown"],
+        "plot_views": ["original_360_with_kpts", "world_3d", "world_xz_topdown"],
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return normalize_command_path(metadata_path)
@@ -962,7 +1029,8 @@ def save_frame_tracks_world_visualization(
     grid = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.25], hspace=0.16, wspace=0.10)
     image_ax = fig.add_subplot(grid[0, :])
     image_ax.imshow(frame_rgb)
-    image_ax.set_title(frame_title or "original 360 frame")
+    image_ax.set_title(frame_title or "original 360 frame with projected keypoints")
+    draw_frame_tracks_overlay(image_ax, tracks, edges, frame_rgb.shape[1], frame_rgb.shape[0], min_conf)
     image_ax.axis("off")
 
     world_ax = fig.add_subplot(grid[1, 0], projection="3d")
