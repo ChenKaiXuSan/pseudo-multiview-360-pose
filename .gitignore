@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+
+# Local editor and agent settings
+.vscode/
+.claude/
+
+# Large local assets and generated media
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.pt
+*.pth
+*.ckpt
+
+# Generated outputs
+*_output/
+*_outputs/
+*_frames/
+*_detected.*
+vlm_analysis_result.txt
