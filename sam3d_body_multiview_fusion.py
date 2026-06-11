@@ -4,13 +4,14 @@ Use tracked 360-video person bboxes to create eight perspective views, run
 SAM3D Body on each view, and fuse the returned 3D keypoints in a shared world
 coordinate system.
 
-The SAM3D Body call is intentionally command-template based because local
-installations often expose different entry points. Example:
+By default this script runs the official SAM3D Body direct API from the
+vendored project copy. A command-template runner can still be supplied as an
+explicit fallback:
 
     python sam3d_body_multiview_fusion.py \
       --sam3d-command 'python run_sam3d_body.py --image {image} --bbox-json {bbox_json} --output {output}'
 
-The command must write a JSON file containing one of these keys:
+The fallback command must write a JSON file containing one of these keys:
     keypoints3d, keypoints_3d, joints3d, joints_3d
 with values shaped as [[x, y, z], ...] or [[x, y, z, conf], ...].
 """
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib.util
 import json
 import math
 import os
@@ -30,6 +32,10 @@ from typing import Any
 
 import cv2
 import numpy as np
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -60,12 +66,18 @@ CONFIG = {
     "min_kpt_conf": 0.0,
     "save_views": True,
 
-    # Direct official SAM 3D Body API integration. Set sam3d_repo when the
-    # facebookresearch/sam-3d-body repo is cloned but not pip-installed.
-    "sam3d_repo": "/mnt/dataset/skiing/third_party/sam-3d-body",
+    # Direct official SAM 3D Body API integration. The official repo is
+    # vendored inside this project so the default path is portable with it.
+    "sam3d_repo": str(SCRIPT_DIR / "third_party" / "sam-3d-body"),
     "sam3d_checkpoint_path": "/mnt/dataset/skiing/checkpoints/sam-3d-body-dinov3/model.ckpt",
     "sam3d_mhr_path": "/mnt/dataset/skiing/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt",
     "sam3d_hf_repo": "facebook/sam-3d-body-dinov3",
+    # Empty by default because multiview fusion supplies tracked bboxes.
+    # Direct full-frame comparison can set this to "vitdet" or "sam3".
+    "sam3d_detector_name": "",
+    "sam3d_detector_path": "",
+    "sam3d_detector_bbox_thr": 0.5,
+    "sam3d_detector_nms_thr": 0.3,
     "sam3d_device": "auto",
     "sam3d_inference_type": "full",
     "sam3d_use_known_intrinsics": True,
@@ -480,19 +492,31 @@ class Sam3DBodyDirectRunner:
             print(f"Loading SAM3D Body from Hugging Face: {hf_repo}")
             model, model_cfg = load_sam_3d_body_hf(hf_repo, device=device)
 
+        human_detector = None
+        detector_name = str(config.get("sam3d_detector_name") or "").strip()
+        if detector_name:
+            print(f"Loading SAM3D Body human detector: {detector_name}")
+            from tools.build_detector import HumanDetector
+
+            detector_kwargs = {}
+            detector_path = str(config.get("sam3d_detector_path") or "").strip()
+            if detector_path:
+                detector_kwargs["path"] = detector_path
+            human_detector = HumanDetector(name=detector_name, device=device, **detector_kwargs)
+
         self.estimator = SAM3DBodyEstimator(
             sam_3d_body_model=model,
             model_cfg=model_cfg,
-            human_detector=None,
+            human_detector=human_detector,
             human_segmentor=None,
             fov_estimator=None,
         )
         self.config = config
 
-    def run(self, image_path: Path, bbox_xyxy: list[int], output_json_path: Path) -> np.ndarray | None:
+    def run(self, image_path: Path, bbox_xyxy: list[int] | None, output_json_path: Path) -> np.ndarray | None:
         import torch
 
-        bboxes = np.asarray([bbox_xyxy], dtype=np.float32)
+        bboxes = None if bbox_xyxy is None else np.asarray([bbox_xyxy], dtype=np.float32)
         cam_int = None
         if self.config.get("sam3d_use_known_intrinsics", True):
             cam_int = make_camera_intrinsics(
@@ -502,21 +526,56 @@ class Sam3DBodyDirectRunner:
                 self.config["vfov_deg"],
             )
 
+        inference_type = str(self.config.get("sam3d_inference_type", "full"))
         with torch.no_grad():
-            outputs = self.estimator.process_one_image(
-                str(image_path),
-                bboxes=bboxes,
-                cam_int=cam_int,
-                use_mask=False,
-                inference_type=self.config.get("sam3d_inference_type", "full"),
-            )
+            try:
+                outputs = self.estimator.process_one_image(
+                    str(image_path),
+                    bboxes=bboxes,
+                    cam_int=cam_int,
+                    det_cat_id=0,
+                    bbox_thr=float(self.config.get("sam3d_detector_bbox_thr", 0.5)),
+                    nms_thr=float(self.config.get("sam3d_detector_nms_thr", 0.3)),
+                    use_mask=False,
+                    inference_type=inference_type,
+                )
+            except KeyError as exc:
+                # Some SAM3D builds raise when full mode expects hand ray features.
+                if inference_type != "body" and "ray_cond_hand" in str(exc):
+                    print(
+                        "    SAM3D Body fallback: missing ray_cond_hand in full mode; "
+                        "retrying with inference_type=body"
+                    )
+                    outputs = self.estimator.process_one_image(
+                        str(image_path),
+                        bboxes=bboxes,
+                        cam_int=cam_int,
+                        det_cat_id=0,
+                        bbox_thr=float(self.config.get("sam3d_detector_bbox_thr", 0.5)),
+                        nms_thr=float(self.config.get("sam3d_detector_nms_thr", 0.3)),
+                        use_mask=False,
+                        inference_type="body",
+                    )
+                else:
+                    raise
 
         payload = {
             "image_path": normalize_command_path(image_path),
             "bbox_format": "xyxy",
-            "bbox_xyxy": [int(v) for v in bbox_xyxy],
+            "detection_mode": "sam3d_internal_detector" if bbox_xyxy is None else "provided_bbox",
             "outputs": numpy_to_jsonable(outputs),
         }
+        if bbox_xyxy is not None:
+            payload["bbox_xyxy"] = [int(v) for v in bbox_xyxy]
+        detected_bboxes = []
+        for item in outputs or []:
+            if isinstance(item, dict) and "bbox" in item:
+                bbox_arr = np.asarray(item["bbox"], dtype=np.float64).reshape(-1)
+                if bbox_arr.size >= 4:
+                    detected_bboxes.append([int(round(float(v))) for v in bbox_arr[:4]])
+        if detected_bboxes:
+            payload["detected_bboxes_xyxy"] = detected_bboxes
+            payload.setdefault("bbox_xyxy", detected_bboxes[0])
         if outputs:
             first = outputs[0]
             if "pred_keypoints_3d" in first:
@@ -600,15 +659,32 @@ def jsonable_to_keypoints(rows: list[list[float]] | None) -> np.ndarray | None:
     return np.asarray(parsed, dtype=np.float64)
 
 
-def load_mhr70_visual_style(sam3d_repo: str) -> dict[str, Any]:
+def load_mhr70_pose_info(sam3d_repo: str) -> dict[str, Any] | None:
     repo = str(sam3d_repo or "").strip()
     if repo:
-        repo_path = str(Path(repo).expanduser().resolve())
-        if repo_path not in sys.path:
-            sys.path.insert(0, repo_path)
+        repo_path = Path(repo).expanduser().resolve()
+        metadata_path = repo_path / "sam_3d_body" / "metadata" / "mhr70.py"
+        if metadata_path.exists():
+            spec = importlib.util.spec_from_file_location("sam3d_mhr70_metadata", metadata_path)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                pose_info = getattr(module, "pose_info", None)
+                if isinstance(pose_info, dict):
+                    return pose_info
+        repo_path_str = str(repo_path)
+        if repo_path_str not in sys.path:
+            sys.path.insert(0, repo_path_str)
     try:
         from sam_3d_body.metadata.mhr70 import pose_info
     except Exception:
+        return None
+    return pose_info
+
+
+def load_mhr70_visual_style(sam3d_repo: str) -> dict[str, Any]:
+    pose_info = load_mhr70_pose_info(sam3d_repo)
+    if pose_info is None:
         return {"edges": [], "edge_colors": [], "point_colors": None}
 
     keypoint_info = pose_info.get("keypoint_info", {})
@@ -843,6 +919,8 @@ def draw_frame_tracks_overlay(
     ax,
     tracks: list[dict[str, Any]],
     edges: list[tuple[int, int]],
+    edge_colors: list[np.ndarray],
+    point_colors: np.ndarray | None,
     width: int,
     height: int,
     min_conf: float,
@@ -859,21 +937,27 @@ def draw_frame_tracks_overlay(
         if not np.any(pixel_mask):
             continue
         track_id = int(track["track_id"])
-        color = track_color_rgb01(track_id)
+        track_color = track_color_rgb01(track_id)
         pts = pixels[pixel_mask]
-        ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=16, edgecolors="white", linewidths=0.4, alpha=0.95)
-        for a, b in edges:
+        ids = np.flatnonzero(pixel_mask)
+        if point_colors is not None and len(point_colors) >= len(kpts):
+            colors = point_colors[ids]
+        else:
+            colors = np.tile(track_color, (len(pts), 1))
+        ax.scatter(pts[:, 0], pts[:, 1], c=colors, s=16, edgecolors="white", linewidths=0.4, alpha=0.95)
+        for edge_idx, (a, b) in enumerate(edges):
             if a < len(kpts) and b < len(kpts) and pixel_mask[a] and pixel_mask[b]:
                 seg = pixels[[a, b], :2]
                 if abs(seg[0, 0] - seg[1, 0]) > width * 0.5:
                     continue
+                color = edge_colors[edge_idx] if edge_idx < len(edge_colors) else track_color
                 ax.plot(seg[:, 0], seg[:, 1], color=color, linewidth=1.2, alpha=0.9)
         bbox = track.get("source_bbox_xyxy")
         if bbox and len(bbox) == 4:
             x1, y1, x2, y2 = [float(v) for v in bbox]
             label_x = min(max(x1, 0.0), max(width - 1.0, 0.0))
             label_y = min(max(y1 - 8.0, 14.0), max(height - 1.0, 14.0))
-            rect = patches.Rectangle((x1, y1), max(x2 - x1, 1.0), max(y2 - y1, 1.0), fill=False, color=color, linewidth=1.4, alpha=0.9)
+            rect = patches.Rectangle((x1, y1), max(x2 - x1, 1.0), max(y2 - y1, 1.0), fill=False, color=track_color, linewidth=1.4, alpha=0.9)
             ax.add_patch(rect)
         else:
             label_x = float(np.nanmedian(pts[:, 0]))
@@ -884,7 +968,7 @@ def draw_frame_tracks_overlay(
             f"track_{track_id:04d}",
             fontsize=8,
             color="white",
-            bbox={"facecolor": color, "edgecolor": "white", "alpha": 0.82, "pad": 2.0},
+            bbox={"facecolor": track_color, "edgecolor": "white", "alpha": 0.82, "pad": 2.0},
         )
 
 
@@ -892,6 +976,8 @@ def draw_frame_tracks_world_axis(
     ax,
     tracks: list[dict[str, Any]],
     edges: list[tuple[int, int]],
+    edge_colors: list[np.ndarray],
+    point_colors: np.ndarray | None,
     show_indices: bool,
     min_conf: float,
 ) -> None:
@@ -911,18 +997,24 @@ def draw_frame_tracks_world_axis(
         pts = plot_all[mask]
         ids = np.flatnonzero(mask)
         track_id = int(track["track_id"])
-        color = track_color_rgb01(track_id)
+        track_color = track_color_rgb01(track_id)
+        if point_colors is not None and len(point_colors) >= len(kpts):
+            colors = point_colors[ids]
+        else:
+            colors = np.tile(track_color, (len(pts), 1))
         label = f"track {track_id:04d}"
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=[color], s=24, depthshade=True, label=label)
-        for a, b in edges:
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors, s=24, depthshade=True, label=label)
+        for edge_idx, (a, b) in enumerate(edges):
             if a < len(kpts) and b < len(kpts) and mask[a] and mask[b]:
                 seg = plot_all[[a, b], :3]
+                color = edge_colors[edge_idx] if edge_idx < len(edge_colors) else track_color
                 ax.plot(seg[:, 0], seg[:, 1], seg[:, 2], color=color, linewidth=1.5, alpha=0.88)
         label_point = pts[np.argmin(pts[:, 2])]
-        ax.text(label_point[0], label_point[1], label_point[2], label, fontsize=8, color=color)
+        ax.text(label_point[0], label_point[1], label_point[2], label, fontsize=8, color=track_color)
         if show_indices:
-            for joint_id, point in zip(ids, pts):
-                ax.text(point[0], point[1], point[2], str(int(joint_id)), fontsize=5, color=color)
+            for color_idx, (joint_id, point) in enumerate(zip(ids, pts)):
+                text_color = colors[color_idx] if len(colors) else track_color
+                ax.text(point[0], point[1], point[2], str(int(joint_id)), fontsize=5, color=text_color)
         all_pts.append(pts)
 
     ax.set_title("all tracks in shared world 3D")
@@ -939,6 +1031,8 @@ def draw_frame_tracks_topdown_axis(
     ax,
     tracks: list[dict[str, Any]],
     edges: list[tuple[int, int]],
+    edge_colors: list[np.ndarray],
+    point_colors: np.ndarray | None,
     min_conf: float,
 ) -> None:
     if not tracks:
@@ -953,15 +1047,21 @@ def draw_frame_tracks_topdown_axis(
             continue
         pts = kpts[mask, :3]
         track_id = int(track["track_id"])
-        color = track_color_rgb01(track_id)
+        track_color = track_color_rgb01(track_id)
+        ids = np.flatnonzero(mask)
+        if point_colors is not None and len(point_colors) >= len(kpts):
+            colors = point_colors[ids]
+        else:
+            colors = np.tile(track_color, (len(pts), 1))
         label = f"track {track_id:04d}"
-        ax.scatter(pts[:, 0], pts[:, 2], c=[color], s=22, label=label)
-        for a, b in edges:
+        ax.scatter(pts[:, 0], pts[:, 2], c=colors, s=22, label=label)
+        for edge_idx, (a, b) in enumerate(edges):
             if a < len(kpts) and b < len(kpts) and mask[a] and mask[b]:
                 seg = kpts[[a, b], :3]
+                color = edge_colors[edge_idx] if edge_idx < len(edge_colors) else track_color
                 ax.plot(seg[:, 0], seg[:, 2], color=color, linewidth=1.4, alpha=0.86)
         label_point = pts[np.argmin(pts[:, 1])]
-        ax.text(label_point[0], label_point[2], label, fontsize=8, color=color)
+        ax.text(label_point[0], label_point[2], label, fontsize=8, color=track_color)
         all_pts.append(pts[:, [0, 2]])
 
     ax.set_title("world XZ top-down")
@@ -1030,13 +1130,13 @@ def save_frame_tracks_world_visualization(
     image_ax = fig.add_subplot(grid[0, :])
     image_ax.imshow(frame_rgb)
     image_ax.set_title(frame_title or "original 360 frame with projected keypoints")
-    draw_frame_tracks_overlay(image_ax, tracks, edges, frame_rgb.shape[1], frame_rgb.shape[0], min_conf)
+    draw_frame_tracks_overlay(image_ax, tracks, edges, edge_colors, point_colors, frame_rgb.shape[1], frame_rgb.shape[0], min_conf)
     image_ax.axis("off")
 
     world_ax = fig.add_subplot(grid[1, 0], projection="3d")
-    draw_frame_tracks_world_axis(world_ax, tracks, edges, show_indices, min_conf)
+    draw_frame_tracks_world_axis(world_ax, tracks, edges, edge_colors, point_colors, show_indices, min_conf)
     topdown_ax = fig.add_subplot(grid[1, 1])
-    draw_frame_tracks_topdown_axis(topdown_ax, tracks, edges, min_conf)
+    draw_frame_tracks_topdown_axis(topdown_ax, tracks, edges, edge_colors, point_colors, min_conf)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     metadata_path = write_frame_tracks_metadata(output_path, tracks, frame_title, min_conf)
@@ -1227,6 +1327,101 @@ def save_multiview_keypoints_grid(
     return normalize_command_path(output_path)
 
 
+def view_image_for_summary(view: dict[str, Any]) -> Path | None:
+    for key in ("kpts2d_vis_path", "vis_path", "image_path"):
+        value = view.get(key)
+        if value and Path(value).exists():
+            return Path(value)
+    view_dir = view.get("view_dir")
+    if view_dir:
+        for name in ("frame_kpts2d.jpg", "frame_bbox.jpg", "frame.jpg"):
+            path = Path(view_dir) / name
+            if path.exists():
+                return path
+    return None
+
+
+def save_track_fused_summary_visualization(
+    person_dir: Path,
+    views: list[dict[str, Any]],
+    fused: np.ndarray | None,
+    edges: list[tuple[int, int]],
+    edge_colors: list[np.ndarray],
+    point_colors: np.ndarray | None,
+    show_indices: bool,
+    min_conf: float,
+    title: str,
+) -> str | None:
+    if fused is None:
+        return None
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    image_views = []
+    for view in sorted(views, key=lambda item: int(item.get("view_index", 0))):
+        image_path = view_image_for_summary(view)
+        if image_path is None:
+            continue
+        image_bgr = cv2.imread(str(image_path))
+        if image_bgr is None:
+            continue
+        image_views.append((view, cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), image_path))
+
+    fused_dir = fused_output_dir(person_dir)
+    fused_dir.mkdir(parents=True, exist_ok=True)
+    output_path = fused_dir / "fused_views_summary.png"
+    metadata_path = fused_dir / "fused_views_summary.json"
+
+    n_tiles = max(1, len(image_views))
+    cols = min(4, n_tiles)
+    rows = int(math.ceil(n_tiles / cols))
+    fig = plt.figure(figsize=(4.4 * cols, 2.7 * rows + 6.2))
+    grid = fig.add_gridspec(rows + 1, cols, height_ratios=[*[1.0] * rows, 2.2], hspace=0.22, wspace=0.08)
+
+    for idx in range(rows * cols):
+        row, col = divmod(idx, cols)
+        ax = fig.add_subplot(grid[row, col])
+        ax.axis("off")
+        if idx >= len(image_views):
+            continue
+        view, image_rgb, _ = image_views[idx]
+        ax.imshow(image_rgb)
+        label = (
+            f"view {int(view.get('view_index', idx)):02d}  "
+            f"yaw {float(view.get('yaw_offset_deg', 0.0)):+.0f}  "
+            f"pitch {float(view.get('pitch_offset_deg', 0.0)):+.0f}"
+        )
+        ax.set_title(label, fontsize=9)
+
+    ax3d = fig.add_subplot(grid[rows, :], projection="3d")
+    draw_keypoints3d_axis(
+        ax3d,
+        fused,
+        title + " fused world 3D",
+        edges,
+        edge_colors,
+        point_colors,
+        show_indices,
+        min_conf,
+        plot_space="world",
+    )
+    fig.suptitle(title, fontsize=13)
+    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    metadata = {
+        "image_path": normalize_command_path(output_path),
+        "title": title,
+        "views": [int(view.get("view_index", idx)) for idx, (view, _, _) in enumerate(image_views)],
+        "view_images": [normalize_command_path(image_path) for _, _, image_path in image_views],
+        "fused_keypoints3d_path": normalize_command_path(fused_dir / "fused_keypoints3d.json"),
+        "plot_views": ["perspective_frames", "fused_world_3d"],
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return normalize_command_path(output_path)
+
+
 def visualize_person_keypoints(
     person_dir: Path,
     views: list[dict[str, Any]],
@@ -1372,6 +1567,21 @@ def visualize_person_keypoints(
         show_indices,
         min_conf,
         plot_space="world",
+    )
+    title = "fused track summary"
+    if canonical_views:
+        first_view = canonical_views[0]
+        title = f"frame {int(first_view['frame_number']):06d} track {int(first_view['track_id']):04d}"
+    vis["fused_views_summary_path"] = save_track_fused_summary_visualization(
+        person_dir,
+        canonical_views,
+        fused,
+        edges,
+        edge_colors,
+        point_colors,
+        show_indices,
+        min_conf,
+        title,
     )
     return vis
 
@@ -1636,16 +1846,16 @@ def parse_view_indices(value: str | None) -> list[int] | None:
     return sorted(set(indices))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="360 bbox -> 8 perspective views -> SAM3D Body -> fused 3D kpts")
     parser.add_argument("--video", default=CONFIG["video_path"], help="360 equirectangular video path")
     parser.add_argument("--bbox-json", default=CONFIG["bbox_json_path"], help="bbox JSON from cotracker_person_tracking.py")
     parser.add_argument("--output-dir", default=CONFIG["output_dir"], help="output directory")
-    parser.add_argument("--frame-number", type=int, default=None, help="only process this 1-based frame number")
+    parser.add_argument("--frame-number", type=int, default=None, help="only process this 1-based frame number; omit to process all frames")
     parser.add_argument("--track-id", type=int, default=None, help="only process this track id")
     parser.add_argument("--max-frames", type=int, default=1, help="maximum bbox frames to process; set 0 for all")
-    parser.add_argument("--run-sam3d", action="store_true", help="run SAM3D Body direct API using --sam3d-hf-repo or local checkpoint")
-    parser.add_argument("--sam3d-command", default=None, help="fallback command template for SAM3D Body")
+    parser.add_argument("--no-run-sam3d", action="store_true", help="skip SAM3D Body and save perspective views/projected bboxes only")
+    parser.add_argument("--sam3d-command", default=None, help="explicit fallback command template for SAM3D Body; overrides the direct API runner")
     parser.add_argument("--sam3d-repo", default=CONFIG["sam3d_repo"], help="path to facebookresearch/sam-3d-body repo")
     parser.add_argument("--sam3d-checkpoint", default=CONFIG["sam3d_checkpoint_path"], help="local SAM3D Body model.ckpt path")
     parser.add_argument("--sam3d-mhr", default=CONFIG["sam3d_mhr_path"], help="local MHR model asset path")
@@ -1666,7 +1876,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-joint-indices", action="store_true", help="hide joint index labels in 3D plots")
     parser.add_argument("--visualize-existing", action="store_true", help="visualize existing SAM3D/fused outputs without running video/SAM3D")
     parser.add_argument("--visualize-frame-existing", action="store_true", help="visualize all existing tracks for one frame in shared world coordinates")
-    return parser.parse_args()
+    parser.add_argument("--no-progress-bar", action="store_true", help="disable tqdm progress bars")
+    return parser.parse_args(argv)
+
+
+def resolve_sam3d_execution(args: argparse.Namespace) -> tuple[bool, str | None]:
+    if args.no_run_sam3d:
+        return False, None
+    if args.sam3d_command:
+        return False, args.sam3d_command
+    return True, None
 
 
 def main() -> int:
@@ -1716,6 +1935,8 @@ def main() -> int:
             print("  views grid: " + vis["views_camera_grid_path"])
         if vis.get("fused_world_vis_path"):
             print("  fused: " + vis["fused_world_vis_path"])
+        if vis.get("fused_views_summary_path"):
+            print("  fused summary: " + vis["fused_views_summary_path"])
         return 0
 
     if args.visualize_frame_existing:
@@ -1746,11 +1967,11 @@ def main() -> int:
         return 1
 
     sam3d_runner = None
-    direct_sam3d_requested = bool(args.run_sam3d)
+    direct_sam3d_requested, sam3d_command = resolve_sam3d_execution(args)
     if direct_sam3d_requested:
         sam3d_runner = Sam3DBodyDirectRunner(config)
-    elif args.sam3d_command is None:
-        print("No SAM3D Body runner supplied; saving perspective views and projected bboxes only.")
+    elif sam3d_command is None:
+        print("SAM3D Body disabled; saving perspective views and projected bboxes only.")
 
     cap = open_video(video_path)
     results = []
@@ -1758,9 +1979,21 @@ def main() -> int:
     total_frames = len(frame_records)
     total_tracks = sum(len(record.get("boxes", [])) for record in frame_records)
     log_progress("main", f"processing {total_frames} frame(s), {total_tracks} track box(es)")
+    use_progress_bar = (not args.no_progress_bar) and tqdm is not None
+    if (not args.no_progress_bar) and tqdm is None:
+        log_progress("main", "tqdm is unavailable; falling back to text logs only")
+
+    frame_iterable = frame_records
+    if use_progress_bar:
+        frame_iterable = tqdm(frame_records, total=total_frames, desc="frames", unit="frame")
+
+    tracks_pbar = None
+    if use_progress_bar:
+        tracks_pbar = tqdm(total=total_tracks, desc="tracks", unit="track")
+
     processed_tracks = 0
     try:
-        for frame_pos, frame_record in enumerate(frame_records, start=1):
+        for frame_pos, frame_record in enumerate(frame_iterable, start=1):
             frame_number = int(frame_record["frame_number"])
             boxes = frame_record.get("boxes", [])
             log_progress("main", f"frame {frame_pos}/{total_frames}: read video frame {frame_number:06d}; tracks={len(boxes)}")
@@ -1768,6 +2001,8 @@ def main() -> int:
             for track_pos, box in enumerate(boxes, start=1):
                 processed_tracks += 1
                 track_id = int(box.get("track_id", box.get("id", -1)))
+                if tracks_pbar is not None:
+                    tracks_pbar.set_postfix_str(f"frame={frame_number:06d} track={track_id:04d}")
                 log_progress("main", f"frame {frame_pos}/{total_frames}, track {track_pos}/{len(boxes)}, total {processed_tracks}/{total_tracks}: start track_{track_id:04d}")
                 results.append(process_person(
                     frame,
@@ -1775,9 +2010,11 @@ def main() -> int:
                     box,
                     output_dir,
                     config,
-                    args.sam3d_command,
+                    sam3d_command,
                     sam3d_runner,
                 ))
+                if tracks_pbar is not None:
+                    tracks_pbar.update(1)
             if config.get("visualize_keypoints", True) and config.get("visualize_frame_tracks", True):
                 log_progress("main", f"frame {frame_pos}/{total_frames}: build combined world visualization")
                 frame_vis = visualize_existing_frame_output(output_dir, frame_number, frame, config, verbose=True)
@@ -1785,6 +2022,10 @@ def main() -> int:
                 if frame_vis.get("frame_tracks_world_vis_path"):
                     print("  frame tracks world: " + frame_vis["frame_tracks_world_vis_path"])
     finally:
+        if tracks_pbar is not None:
+            tracks_pbar.close()
+        if use_progress_bar and hasattr(frame_iterable, "close"):
+            frame_iterable.close()
         cap.release()
 
     summary = {

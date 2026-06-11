@@ -30,18 +30,18 @@ CONFIG = {
     "video_path": "/mnt/dataset/skiing/raw_new/kimura2_360.mp4",
     "output_path": "/mnt/dataset/skiing/raw_new/kimura2_360_cotracker_tracked.mp4",
     "frames_output_dir": "/mnt/dataset/skiing/raw_new/kimura2_360_cotracker_frames",
-    "bbox_output_path": "/mnt/dataset/skiing/raw_new/kimura2_360_cotracker_bboxes.json",
+    "bbox_output_path": "/mnt/dataset/skiing/raw_new/kimura2_360_cotracker_bboxes_yolo.json",
 
     # Models
-    "yolo_model_path": "yolov8n.pt",
-    "pose_model_path": "yolov8n-pose.pt",
+    "yolo_model_path": "yolo26x.pt",
+    "pose_model_path": "yolo26x-pose.pt",
     "cotracker_hub_repo": "facebookresearch/co-tracker",
     "cotracker_model_name": "cotracker3_offline",
 
     # Pose/keypoint seeding inside each detected box crop
     "use_pose_keypoints": True,
-    "pose_conf": 0.35,
-    "pose_kpt_conf": 0.35,
+    "pose_conf": 0.5,
+    "pose_kpt_conf": 0.5,
     "pose_crop_padding_ratio": 0.20,
     "min_pose_keypoints": 5,
     "fallback_to_grid_points": True,
