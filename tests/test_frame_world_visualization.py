@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import json
 import io
+import sys
 import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import cv2
 import numpy as np
@@ -217,7 +222,7 @@ def test_save_sam3d_payload_npz_preserves_full_payload_and_common_arrays() -> No
     assert keypoints3d.shape == (2, 3)
 
 
-def test_write_person_result_saves_fused_keypoints_npz() -> None:
+def test_write_person_result_defaults_to_compact_fused_dir_only() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         person_dir = Path(tmp) / "frame_000001" / "track_0001"
         result = {
@@ -230,18 +235,39 @@ def test_write_person_result_saves_fused_keypoints_npz() -> None:
         }
 
         write_person_result(person_dir, result)
+        root_json = person_dir / "fused_keypoints3d.json"
         root_npz = person_dir / "fused_keypoints3d_world.npz"
+        fused_json = person_dir / "fused" / "fused_keypoints3d.json"
         fused_npz = person_dir / "fused" / "fused_keypoints3d_world.npz"
         with np.load(fused_npz, allow_pickle=False) as data:
             kpts = data["fused_keypoints3d_world"]
             meta = json.loads(str(data["metadata_json"]))
 
-        assert root_npz.exists()
+        assert not root_json.exists()
+        assert not root_npz.exists()
+        assert fused_json.exists()
         assert fused_npz.exists()
         assert np.allclose(kpts[0], [1.0, 2.0, 3.0, 0.9])
         assert np.isnan(kpts[1, 0])
         assert meta["frame_number"] == 1
         assert meta["track_id"] == 1
+
+
+def test_write_person_result_can_write_legacy_root_duplicates() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        person_dir = Path(tmp) / "frame_000001" / "track_0001"
+        result = {
+            "frame_number": 1,
+            "track_id": 1,
+            "fused_keypoints3d_world": [[1.0, 2.0, 3.0, 0.9]],
+        }
+
+        write_person_result(person_dir, result, write_legacy_root=True)
+
+        assert (person_dir / "fused_keypoints3d.json").exists()
+        assert (person_dir / "fused_keypoints3d_world.npz").exists()
+        assert (person_dir / "fused" / "fused_keypoints3d.json").exists()
+        assert (person_dir / "fused" / "fused_keypoints3d_world.npz").exists()
 
 
 def test_save_fused_keypoints_npz_handles_missing_fused_array() -> None:
@@ -516,7 +542,8 @@ if __name__ == "__main__":
     test_sam3d_view_pool_uses_one_runner_per_worker_and_preserves_order()
     test_sam3d_view_failure_is_recorded_and_skipped()
     test_save_sam3d_payload_npz_preserves_full_payload_and_common_arrays()
-    test_write_person_result_saves_fused_keypoints_npz()
+    test_write_person_result_defaults_to_compact_fused_dir_only()
+    test_write_person_result_can_write_legacy_root_duplicates()
     test_save_fused_keypoints_npz_handles_missing_fused_array()
     test_collect_frame_world_tracks_reads_sorted_tracks()
     test_world_keypoints_project_to_equirectangular_pixels()

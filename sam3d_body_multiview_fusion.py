@@ -456,17 +456,31 @@ def canonicalize_view_assets(person_dir: Path, view: dict[str, Any]) -> dict[str
     return view
 
 
-def write_person_result(person_dir: Path, result: dict[str, Any]) -> None:
+def fused_result_json_path(person_dir: Path) -> Path:
+    """Return the preferred compact fused JSON path for one person track."""
+    return fused_output_dir(person_dir) / "fused_keypoints3d.json"
+
+
+def resolve_fused_result_json_path(person_dir: Path) -> Path:
+    """Return an existing fused JSON path, accepting legacy root output as fallback."""
+    root_path = person_dir / "fused_keypoints3d.json"
+    if root_path.exists():
+        return root_path
+    return fused_result_json_path(person_dir)
+
+
+def write_person_result(person_dir: Path, result: dict[str, Any], write_legacy_root: bool = False) -> None:
     """Write one track-level multiview result JSON and fused keypoint NPZ files."""
     person_dir.mkdir(parents=True, exist_ok=True)
-    root_path = person_dir / "fused_keypoints3d.json"
-    root_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    save_fused_keypoints_npz(result, person_dir / "fused_keypoints3d_world.npz")
-
     fused_dir = fused_output_dir(person_dir)
     fused_dir.mkdir(parents=True, exist_ok=True)
-    (fused_dir / "fused_keypoints3d.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    fused_result_json_path(person_dir).write_text(json.dumps(result, indent=2), encoding="utf-8")
     save_fused_keypoints_npz(result, fused_dir / "fused_keypoints3d_world.npz")
+
+    if write_legacy_root:
+        root_path = person_dir / "fused_keypoints3d.json"
+        root_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        save_fused_keypoints_npz(result, person_dir / "fused_keypoints3d_world.npz")
 
 
 def write_view_bbox_json(path: Path, bbox_xyxy: list[int], image_path: Path, meta: dict[str, Any]) -> None:
@@ -1874,7 +1888,7 @@ def visualize_person_keypoints(
 
 def visualize_existing_person_output(person_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
     """Regenerate per-track visualizations from existing output JSON files."""
-    fused_path = person_dir / "fused_keypoints3d.json"
+    fused_path = resolve_fused_result_json_path(person_dir)
     if not fused_path.exists():
         raise FileNotFoundError(f"missing fused output: {fused_path}")
     with fused_path.open("r", encoding="utf-8") as f:
@@ -1902,7 +1916,7 @@ def visualize_existing_person_output(person_dir: Path, config: dict[str, Any]) -
     result["num_fused_views"] = len(keypoints_world)
     vis = visualize_person_keypoints(person_dir, views, fused, config)
     result["visualization"] = vis
-    write_person_result(person_dir, result)
+    write_person_result(person_dir, result, write_legacy_root=bool(config.get("write_legacy_fused_root", False)))
     return vis
 
 
@@ -2166,7 +2180,7 @@ def process_person(
         "num_fused_views": len(keypoints_world),
         "visualization": visualization,
     }
-    write_person_result(person_dir, result)
+    write_person_result(person_dir, result, write_legacy_root=bool(config.get("write_legacy_fused_root", False)))
     return result
 
 
@@ -2241,6 +2255,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--visualize-existing", action="store_true", help="visualize existing SAM3D/fused outputs without running video/SAM3D")
     parser.add_argument("--visualize-frame-existing", action="store_true", help="visualize all existing tracks for one frame in shared world coordinates")
     parser.add_argument("--no-progress-bar", action="store_true", help="disable tqdm progress bars")
+    parser.add_argument("--write-legacy-fused-root", action="store_true", help="also write duplicate fused_keypoints3d files in each track root for old tools")
     return parser.parse_args(argv)
 
 
@@ -2282,6 +2297,7 @@ def main() -> int:
         "visualize_keypoints": not args.no_kpt_vis,
         "visualize_joint_indices": not args.no_joint_indices,
         "visualize_frame_tracks": CONFIG["visualize_frame_tracks"],
+        "write_legacy_fused_root": bool(args.write_legacy_fused_root),
     })
 
     bbox_json_path = Path(args.bbox_json)
