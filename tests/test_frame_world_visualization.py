@@ -18,11 +18,21 @@ from sam3d_body_multiview_fusion import (
     draw_frame_tracks_overlay,
     draw_frame_tracks_world_axis,
     parse_args,
+    expand_sam3d_runner_devices,
     resolve_sam3d_execution,
+    resolve_sam3d_devices,
+    resolve_sam3d_result_output_dir,
+    resolve_video_output_dir,
+    run_sam3d_for_view,
+    run_sam3d_for_views,
+    save_fused_keypoints_npz,
     save_frame_tracks_world_visualization,
+    save_sam3d_payload_npz,
     save_track_fused_summary_visualization,
     load_mhr70_visual_style,
+    person_center_to_lon_lat,
     track_color_rgb01,
+    write_person_result,
     world_keypoints_to_equirectangular_pixels,
 )
 
@@ -71,6 +81,179 @@ def test_no_run_sam3d_disables_direct_and_command_runners() -> None:
     assert command is None
 
 
+def test_output_root_resolves_to_video_named_subdirectory() -> None:
+    output_dir = resolve_video_output_dir(
+        Path("/tmp/sam3d_body_multiview"),
+        Path("/mnt/dataset/skiing/360test/kimura2_360.mp4"),
+    )
+
+    assert output_dir == Path("/tmp/sam3d_body_multiview/kimura2_360")
+
+
+def test_sam3d_results_are_stored_in_video_level_results_folder() -> None:
+    person_dir = Path("/tmp/sam3d_body_multiview/kimura2_360/frame_000123/track_0007")
+
+    result_dir = resolve_sam3d_result_output_dir(person_dir, 3)
+
+    assert result_dir == Path(
+        "/tmp/sam3d_body_multiview/kimura2_360/sam3d_results/frame_000123/track_0007/view_03"
+    )
+
+
+def test_cli_exposes_device_pool_without_legacy_single_device_flag() -> None:
+    args = parse_args([])
+
+    assert args.sam3d_devices == "auto"
+    assert not hasattr(args, "sam3d_device")
+
+
+def test_auto_sam3d_devices_use_all_available_cuda_devices() -> None:
+    assert resolve_sam3d_devices("auto", cuda_available=True, cuda_count=2) == ["cuda:0", "cuda:1"]
+    assert resolve_sam3d_devices("auto", cuda_available=True, cuda_count=1) == ["cuda:0"]
+    assert resolve_sam3d_devices("auto", cuda_available=False, cuda_count=0) == ["cpu"]
+
+
+def test_expand_sam3d_runner_devices_respects_estimators_per_device_and_cap() -> None:
+    assert expand_sam3d_runner_devices(["cuda:0", "cuda:1"], 2, 8) == [
+        "cuda:0",
+        "cuda:0",
+        "cuda:1",
+        "cuda:1",
+    ]
+    assert expand_sam3d_runner_devices(["cuda:0", "cuda:1"], 2, 3) == [
+        "cuda:0",
+        "cuda:0",
+        "cuda:1",
+    ]
+    assert expand_sam3d_runner_devices(["cuda:0", "cuda:1"], 0, 8) == ["cuda:0", "cuda:1"]
+
+
+def test_sam3d_view_pool_uses_one_runner_per_worker_and_preserves_order() -> None:
+    class RecordingRunner:
+        def __init__(self, name):
+            self.name = name
+            self.calls = []
+
+        def run(self, image_path, bbox_xyxy, output_json_path):
+            self.calls.append(Path(image_path).name)
+            return np.array([[float(self.name), 0.0, 0.0, 1.0]], dtype=np.float64)
+
+    views = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for idx in range(4):
+            view_dir = root / f"view_{idx:02d}"
+            view_dir.mkdir()
+            views.append({
+                "view_index": idx,
+                "image_path": str(view_dir / f"frame_{idx}.jpg"),
+                "bbox_json_path": str(view_dir / "bbox.json"),
+                "sam3d_output_path": str(view_dir / "sam3d.json"),
+                "bbox_xyxy": [10, 20, 30, 40],
+            })
+
+        runners = [RecordingRunner(0), RecordingRunner(1)]
+        results = run_sam3d_for_views(views, {"sam3d_view_workers": 0}, None, runners)
+
+    assert [view["view_index"] for view, _ in results] == [0, 1, 2, 3]
+    assert [int(kpts[0, 0]) for _, kpts in results] == [0, 1, 0, 1]
+    assert len(runners[0].calls) == 2
+    assert len(runners[1].calls) == 2
+
+
+def test_sam3d_view_failure_is_recorded_and_skipped() -> None:
+    class FailingRunner:
+        def run(self, image_path, bbox_xyxy, output_json_path):
+            raise IndexError("index is out of bounds for dimension with size 0")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        view_dir = Path(tmp) / "view_00"
+        view_dir.mkdir()
+        view = {
+            "view_index": 0,
+            "image_path": str(view_dir / "frame.jpg"),
+            "bbox_json_path": str(view_dir / "bbox.json"),
+            "sam3d_output_path": str(view_dir / "sam3d.json"),
+            "bbox_xyxy": [10, 20, 30, 40],
+        }
+
+        kpts = run_sam3d_for_view(view, {}, None, FailingRunner())
+        payload = json.loads((view_dir / "sam3d.json").read_text(encoding="utf-8"))
+
+    assert kpts is None
+    assert payload["status"] == "failed"
+    assert payload["error_type"] == "IndexError"
+    assert "index is out of bounds" in payload["error"]
+
+
+def test_save_sam3d_payload_npz_preserves_full_payload_and_common_arrays() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        output_path = Path(tmp) / "view_00" / "sam3d.npz"
+        payload = {
+            "image_path": "/tmp/frame.jpg",
+            "outputs": [{
+                "pred_keypoints_3d": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                "pred_cam_t": [0.1, 0.2, 0.3],
+                "scores": [0.9],
+            }],
+            "keypoints3d": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            "keypoints3d_camera": [[1.1, 2.2, 3.3], [4.1, 5.2, 6.3]],
+            "keypoints2d": [[10.0, 20.0], [30.0, 40.0]],
+            "joint_coords": [[7.0, 8.0, 9.0]],
+        }
+
+        saved = save_sam3d_payload_npz(payload, output_path)
+        with np.load(saved, allow_pickle=False) as data:
+            payload_roundtrip = json.loads(str(data["payload_json"]))
+            keys = set(data.files)
+            keypoints3d = data["keypoints3d"]
+
+    assert saved == output_path
+    assert payload_roundtrip["outputs"][0]["scores"] == [0.9]
+    assert "keypoints3d" in keys
+    assert "keypoints3d_camera" in keys
+    assert "keypoints2d" in keys
+    assert "joint_coords" in keys
+    assert keypoints3d.shape == (2, 3)
+
+
+def test_write_person_result_saves_fused_keypoints_npz() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        person_dir = Path(tmp) / "frame_000001" / "track_0001"
+        result = {
+            "frame_number": 1,
+            "track_id": 1,
+            "fused_keypoints3d_world": [
+                [1.0, 2.0, 3.0, 0.9],
+                [None, None, None, 0.0],
+            ],
+        }
+
+        write_person_result(person_dir, result)
+        root_npz = person_dir / "fused_keypoints3d_world.npz"
+        fused_npz = person_dir / "fused" / "fused_keypoints3d_world.npz"
+        with np.load(fused_npz, allow_pickle=False) as data:
+            kpts = data["fused_keypoints3d_world"]
+            meta = json.loads(str(data["metadata_json"]))
+
+        assert root_npz.exists()
+        assert fused_npz.exists()
+        assert np.allclose(kpts[0], [1.0, 2.0, 3.0, 0.9])
+        assert np.isnan(kpts[1, 0])
+        assert meta["frame_number"] == 1
+        assert meta["track_id"] == 1
+
+
+def test_save_fused_keypoints_npz_handles_missing_fused_array() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        output_path = Path(tmp) / "fused_keypoints3d_world.npz"
+
+        saved = save_fused_keypoints_npz({"frame_number": 1}, output_path)
+
+    assert saved is None
+    assert not output_path.exists()
+
+
 def test_collect_frame_world_tracks_reads_sorted_tracks() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         frame_dir = Path(tmp) / "frame_000092"
@@ -95,6 +278,41 @@ def test_world_keypoints_project_to_equirectangular_pixels() -> None:
     assert np.allclose(pixels[0], [200.0, 100.0])
     assert np.allclose(pixels[1], [300.0, 100.0])
     assert np.allclose(pixels[2], [200.0, 0.0])
+
+
+def test_person_center_prefers_track_points_across_360_seam() -> None:
+    box = {
+        "bbox_xyxy": [180, 40, 220, 120],
+        "track_points_source": "pose",
+        "track_points_xy": [
+            [395.0, 100.0],
+            [5.0, 102.0],
+            [398.0, 98.0],
+        ],
+    }
+
+    lon, lat, source = person_center_to_lon_lat(box, width=400, height=200)
+
+    assert source == "pose"
+    assert abs(abs(np.degrees(lon)) - 180.0) < 3.0
+    assert abs(np.degrees(lat)) < 5.0
+
+
+def test_person_center_uses_bbox_when_track_points_are_not_pose() -> None:
+    box = {
+        "bbox_xyxy": [180, 40, 220, 120],
+        "track_points_source": "grid",
+        "track_points_xy": [
+            [395.0, 100.0],
+            [5.0, 102.0],
+            [398.0, 98.0],
+        ],
+    }
+
+    lon, lat, source = person_center_to_lon_lat(box, width=400, height=200)
+
+    assert source == "bbox"
+    assert np.allclose([np.degrees(lon), np.degrees(lat)], [0.0, 18.0])
 
 
 def test_save_frame_tracks_world_visualization_writes_png() -> None:
@@ -291,8 +509,19 @@ if __name__ == "__main__":
     test_load_mhr70_visual_style_from_repo_path_without_package_deps()
     test_cli_defaults_to_official_sam3d_without_run_flag()
     test_no_run_sam3d_disables_direct_and_command_runners()
+    test_sam3d_results_are_stored_in_video_level_results_folder()
+    test_cli_exposes_device_pool_without_legacy_single_device_flag()
+    test_auto_sam3d_devices_use_all_available_cuda_devices()
+    test_expand_sam3d_runner_devices_respects_estimators_per_device_and_cap()
+    test_sam3d_view_pool_uses_one_runner_per_worker_and_preserves_order()
+    test_sam3d_view_failure_is_recorded_and_skipped()
+    test_save_sam3d_payload_npz_preserves_full_payload_and_common_arrays()
+    test_write_person_result_saves_fused_keypoints_npz()
+    test_save_fused_keypoints_npz_handles_missing_fused_array()
     test_collect_frame_world_tracks_reads_sorted_tracks()
     test_world_keypoints_project_to_equirectangular_pixels()
+    test_person_center_prefers_track_points_across_360_seam()
+    test_person_center_uses_bbox_when_track_points_are_not_pose()
     test_save_frame_tracks_world_visualization_writes_png()
     test_visualization_writes_metadata_and_uses_stable_track_colors()
     test_frame_track_axes_use_skeleton_style_colors()

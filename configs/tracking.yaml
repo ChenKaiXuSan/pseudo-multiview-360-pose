@@ -1,0 +1,7 @@
+# Stage 1: track people in a 360-degree video.
+video_path: /mnt/dataset/skiing/360test/kimura2_360.mp4
+output_dir: /mnt/dataset/skiing/360tracker_outputs/kimura2_360
+yolo_model_path: /mnt/dataset/skiing/360PoseFusion/yolo26x-sem.pt
+track_points_source: pose
+max_frames: 0
+

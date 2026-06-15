@@ -80,6 +80,149 @@ def equirectangular_to_face(equirect_img, face_size=1024, face=0):
     return cubemap_face
 
 
+def rotation_matrix_yaw_pitch(yaw_deg, pitch_deg):
+    """Return a camera-to-world rotation for yaw/pitch in degrees."""
+    yaw = np.radians(float(yaw_deg))
+    pitch = np.radians(float(pitch_deg))
+
+    forward = np.array([
+        np.sin(yaw) * np.cos(pitch),
+        np.sin(pitch),
+        np.cos(yaw) * np.cos(pitch),
+    ], dtype=np.float32)
+    forward /= max(np.linalg.norm(forward), 1e-6)
+
+    world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    right = np.cross(world_up, forward)
+    if np.linalg.norm(right) < 1e-6:
+        right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    right /= max(np.linalg.norm(right), 1e-6)
+    up = np.cross(forward, right)
+    up /= max(np.linalg.norm(up), 1e-6)
+
+    return right, up, forward
+
+
+def perspective_view_xyz(u, v, yaw_deg, pitch_deg, fov_deg):
+    """Map normalized perspective view coords to 3D directions."""
+    right, up, forward = rotation_matrix_yaw_pitch(yaw_deg, pitch_deg)
+    half_fov = np.tan(np.radians(float(fov_deg)) * 0.5)
+    x_cam = u * half_fov
+    y_cam = v * half_fov
+
+    x = forward[0] + x_cam * right[0] + y_cam * up[0]
+    y = forward[1] + x_cam * right[1] + y_cam * up[1]
+    z = forward[2] + x_cam * right[2] + y_cam * up[2]
+    norm = np.sqrt(x**2 + y**2 + z**2)
+    return x / norm, y / norm, z / norm
+
+
+def equirectangular_to_perspective(equirect_img, view_size=1024, yaw_deg=0, pitch_deg=0, fov_deg=100):
+    """Project an equirectangular frame to one perspective view."""
+    h, w = equirect_img.shape[:2]
+    coords = np.zeros((view_size, view_size, 2), dtype=np.float32)
+
+    u = (np.arange(view_size) / view_size - 0.5) * 2
+    v = -(np.arange(view_size) / view_size - 0.5) * 2
+    u, v = np.meshgrid(u, v)
+
+    x, y, z = perspective_view_xyz(u, v, yaw_deg, pitch_deg, fov_deg)
+    _, _, x_e, y_e = xyz_to_equirectangular(x, y, z, w, h)
+    coords[..., 0] = x_e
+    coords[..., 1] = y_e
+    return cv2.remap(equirect_img, coords, None, cv2.INTER_LINEAR)
+
+
+def build_detection_views(
+    enable_extra_views=False,
+    horizontal_extra_yaws=None,
+    upper_extra_pitch=55,
+    lower_extra_pitch=-55,
+    vertical_extra_yaws=None,
+    extra_view_fov_deg=100,
+):
+    """Build the detection view layout: 6 cubemap faces plus optional overlap views."""
+    views = [{"type": "cubemap", "face": face_id, "name": f"face{face_id}"} for face_id in range(6)]
+    if not enable_extra_views:
+        return views
+
+    horizontal_extra_yaws = horizontal_extra_yaws or [45, 135, 225, 315]
+    vertical_extra_yaws = vertical_extra_yaws or [0, 90, 180, 270]
+
+    for yaw in horizontal_extra_yaws:
+        views.append({
+            "type": "perspective",
+            "yaw": float(yaw),
+            "pitch": 0.0,
+            "fov": float(extra_view_fov_deg),
+            "name": f"yaw{int(yaw)}_pitch0",
+        })
+    for yaw in vertical_extra_yaws:
+        views.append({
+            "type": "perspective",
+            "yaw": float(yaw),
+            "pitch": float(upper_extra_pitch),
+            "fov": float(extra_view_fov_deg),
+            "name": f"yaw{int(yaw)}_pitch{int(upper_extra_pitch)}",
+        })
+    for yaw in vertical_extra_yaws:
+        views.append({
+            "type": "perspective",
+            "yaw": float(yaw),
+            "pitch": float(lower_extra_pitch),
+            "fov": float(extra_view_fov_deg),
+            "name": f"yaw{int(yaw)}_pitch{int(lower_extra_pitch)}",
+        })
+    return views
+
+
+def render_detection_view(frame, view, face_size):
+    """Render a configured cubemap or perspective detection view."""
+    if view["type"] == "cubemap":
+        return equirectangular_to_face(frame, face_size=face_size, face=int(view["face"]))
+    return equirectangular_to_perspective(
+        frame,
+        view_size=face_size,
+        yaw_deg=view["yaw"],
+        pitch_deg=view["pitch"],
+        fov_deg=view["fov"],
+    )
+
+
+def project_view_point_to_equirectangular(x_view, y_view, view, face_size, width, height):
+    """Map one detection-view pixel back into equirectangular coordinates."""
+    u_c = 2.0 * x_view / face_size - 1.0
+    v_c = 1.0 - 2.0 * y_view / face_size
+    if view["type"] == "cubemap":
+        cx, cy, cz = cubemap_face_xyz(u_c, v_c, int(view["face"]))
+    else:
+        cx, cy, cz = perspective_view_xyz(u_c, v_c, view["yaw"], view["pitch"], view["fov"])
+    return xyz_to_equirectangular(cx, cy, cz, width, height)
+
+
+def make_view_debug_grid(view_images, view_names, output_width=1800):
+    """Create one tiled visualization image for all projected detection views."""
+    if not view_images:
+        return None
+    thumb_w = max(160, output_width // 6)
+    thumb_h = thumb_w
+    thumbs = []
+    for image, name in zip(view_images, view_names):
+        thumb = cv2.resize(image, (thumb_w, thumb_h))
+        cv2.rectangle(thumb, (0, 0), (thumb_w, 26), (0, 0, 0), -1)
+        cv2.putText(thumb, name, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        thumbs.append(thumb)
+
+    cols = 6
+    rows = int(np.ceil(len(thumbs) / cols))
+    grid = np.zeros((rows * thumb_h, cols * thumb_w, 3), dtype=thumbs[0].dtype)
+    for idx, thumb in enumerate(thumbs):
+        row = idx // cols
+        col = idx % cols
+        grid[row * thumb_h:(row + 1) * thumb_h, col * thumb_w:(col + 1) * thumb_w] = thumb
+    return grid
+
+
 def face_to_equirectangular_coords(face_size, face=0):
     """
     获取立方体面到等距柱投影的坐标映射
@@ -176,6 +319,104 @@ def sphere_distance(phi1, lat1, phi2, lat2):
     return float(np.degrees(np.arctan2(sin_angle, np.clip(cos_angle, -1.0, 1.0))))
 
 
+def detection_box_area(det):
+    """Return the area of one detection box."""
+    return max(1.0, float(det["x2"] - det["x1"])) * max(1.0, float(det["y2"] - det["y1"]))
+
+
+def detection_aspect(det):
+    """Return the width-to-height aspect ratio for one detection box."""
+    width = max(1.0, float(det["x2"] - det["x1"]))
+    height = max(1.0, float(det["y2"] - det["y1"]))
+    return width / height
+
+
+def detection_completeness_score(det, cluster_area_ref=1.0):
+    """Score whether a detection box looks like a complete person projection."""
+    height = max(1.0, float(det["y2"] - det["y1"]))
+    width = max(1.0, float(det["x2"] - det["x1"]))
+    area = width * height
+    aspect = width / height
+    conf = float(det.get("conf", 0.0))
+
+    area_score = min(1.0, area / max(1.0, cluster_area_ref))
+    height_score = min(1.0, height / 900.0)
+    aspect_penalty = 0.0
+    if aspect > 1.4:
+        aspect_penalty = min(1.0, (aspect - 1.4) / 1.4)
+    elif aspect < 0.18:
+        aspect_penalty = min(1.0, (0.18 - aspect) / 0.18)
+
+    return conf + 0.70 * area_score + 0.55 * height_score - 0.65 * aspect_penalty
+
+
+def detections_same_person(det1, det2, angle_threshold_deg, iou_threshold, containment_threshold):
+    """Decide whether two projected detections represent the same person."""
+    angle_match = False
+    if "_phi" in det1 and "_lat" in det1 and "_phi" in det2 and "_lat" in det2:
+        angle_match = sphere_distance(det1["_phi"], det1["_lat"], det2["_phi"], det2["_lat"]) < angle_threshold_deg
+
+    iou = compute_iou(det1, det2)
+    containment = compute_containment(det1, det2)
+    if iou > iou_threshold or containment > containment_threshold:
+        return True
+
+    if angle_match:
+        area1 = detection_box_area(det1)
+        area2 = detection_box_area(det2)
+        area_ratio = min(area1, area2) / max(area1, area2)
+        aspect1 = detection_aspect(det1)
+        aspect2 = detection_aspect(det2)
+        plausible_fragment = area_ratio >= 0.08 and max(aspect1, aspect2) / max(0.1, min(aspect1, aspect2)) <= 5.0
+        return plausible_fragment
+
+    return False
+
+
+def cluster_view_detections(
+    detections,
+    angle_threshold_deg=8.0,
+    iou_threshold=0.10,
+    containment_threshold=0.30,
+):
+    """Cluster multi-view projected detections and keep one representative per person."""
+    if not detections:
+        return []
+
+    clusters = []
+    for det in sorted(detections, key=lambda item: float(item.get("conf", 0.0)), reverse=True):
+        if det.get("class") != "person":
+            clusters.append([det])
+            continue
+
+        best_cluster = None
+        for cluster in clusters:
+            if not cluster or cluster[0].get("class") != det.get("class"):
+                continue
+            if any(detections_same_person(det, other, angle_threshold_deg, iou_threshold, containment_threshold) for other in cluster):
+                best_cluster = cluster
+                break
+
+        if best_cluster is None:
+            clusters.append([det])
+        else:
+            best_cluster.append(det)
+
+    # Keep the most complete representative instead of blindly taking the
+    # highest-confidence fragment from a split projection.
+    representatives = []
+    for cluster in clusters:
+        max_area = max(detection_box_area(det) for det in cluster)
+        best = max(cluster, key=lambda det: detection_completeness_score(det, max_area))
+        best = dict(best)
+        best["cluster_size"] = len(cluster)
+        best["cluster_views"] = [det.get("view_name", det.get("face_id")) for det in cluster]
+        representatives.append(best)
+
+    representatives.sort(key=lambda det: float(det.get("conf", 0.0)), reverse=True)
+    return representatives
+
+
 def non_max_suppression_sphere(
     detections,
     angle_threshold_deg=5.0,
@@ -189,6 +430,8 @@ def non_max_suppression_sphere(
     classes = set(d["class"] for d in detections)
     kept = []
 
+    # Suppress duplicates independently per class because cubemap and extra
+    # perspective views may project the same person into several image crops.
     for cls in classes:
         cls_dets = [d for d in detections if d["class"] == cls]
         cls_dets.sort(key=lambda x: x["conf"], reverse=True)
@@ -266,6 +509,13 @@ def cubemap_sliding_detection(
     nms_angle_threshold_deg=5.0,
     nms_iou_threshold=0.35,
     nms_containment_threshold=0.65,
+    enable_extra_views=False,
+    horizontal_extra_yaws=None,
+    upper_extra_pitch=55,
+    lower_extra_pitch=-55,
+    vertical_extra_yaws=None,
+    extra_view_fov_deg=100,
+    view_debug_path=None,
 ):
     """
     在立方体面投影上滑动窗口检测（进行畸变矫正）
@@ -281,6 +531,8 @@ def cubemap_sliding_detection(
         nms_angle_threshold_deg: 球面中心距离NMS阈值（度）
         nms_iou_threshold: 平面IoU NMS阈值
         nms_containment_threshold: 小框包含率NMS阈值
+        enable_extra_views: 是否追加水平/上下 overlap perspective views
+        view_debug_path: 如果提供，保存本帧所有检测 view 的拼图
 
     Returns:
         detections: NMS后的检测结果
@@ -288,22 +540,30 @@ def cubemap_sliding_detection(
     """
     h, w = frame.shape[:2]
 
-    # 检测的窗口配置（每个立方体面的配置）
-    num_faces = 6  # 立方体6个面
     window_w_per_face = int(face_size * window_width_ratio)
     step_w = step_size
+    views = build_detection_views(
+        enable_extra_views=enable_extra_views,
+        horizontal_extra_yaws=horizontal_extra_yaws,
+        upper_extra_pitch=upper_extra_pitch,
+        lower_extra_pitch=lower_extra_pitch,
+        vertical_extra_yaws=vertical_extra_yaws,
+        extra_view_fov_deg=extra_view_fov_deg,
+    )
 
     all_detections = []
+    view_debug_images = []
+    view_debug_names = []
 
-    # 遍历每个立方体面
-    for face_id in range(num_faces):
-        # 转换为立方体面
-        face_img = equirectangular_to_face(frame, face_size=face_size, face=face_id)
+    for view_idx, view in enumerate(views):
+        view_img = render_detection_view(frame, view, face_size)
+        if view_debug_path:
+            view_debug_images.append(view_img.copy())
+            view_debug_names.append(view["name"])
 
-        # 滑动窗口检测
         x_start = 0
         while x_start + window_w_per_face <= face_size:
-            window = face_img[:, x_start:x_start + window_w_per_face]
+            window = view_img[:, x_start:x_start + window_w_per_face]
             results = model(window, verbose=False, conf=conf)
 
             for box in results[0].boxes:
@@ -314,30 +574,23 @@ def cubemap_sliding_detection(
                     x1_rel, y1_rel, x2_rel, y2_rel = box.xyxy[0].cpu().numpy()
                     conf_score = box.conf[0].cpu().numpy()
 
-                    x1_face = x1_rel + x_start
-                    x2_face = x2_rel + x_start
+                    x1_view = x1_rel + x_start
+                    x2_view = x2_rel + x_start
 
-                    # bbox 回投是非线性的；沿四条边多采样，比只投四个角稳定得多。
-                    xs = np.linspace(x1_face, x2_face, edge_samples)
+                    xs = np.linspace(x1_view, x2_view, edge_samples)
                     ys = np.linspace(y1_rel, y2_rel, edge_samples)
                     sample_points = []
                     sample_points.extend((x, y1_rel) for x in xs)
                     sample_points.extend((x, y2_rel) for x in xs)
-                    sample_points.extend((x1_face, y) for y in ys)
-                    sample_points.extend((x2_face, y) for y in ys)
+                    sample_points.extend((x1_view, y) for y in ys)
+                    sample_points.extend((x2_view, y) for y in ys)
 
-                    phis = []
-                    lats = []
                     x_vals = []
                     y_vals = []
-                    for x_face, y_face in sample_points:
-                        u_c = 2.0 * x_face / face_size - 1.0
-                        v_c = 1.0 - 2.0 * y_face / face_size
-                        cx, cy, cz = cubemap_face_xyz(u_c, v_c, face_id)
-                        phi_val, lat_val, x_e, y_e = xyz_to_equirectangular(cx, cy, cz, w, h)
-
-                        phis.append(float(phi_val))
-                        lats.append(float(lat_val))
+                    for x_view, y_view in sample_points:
+                        _phi_val, _lat_val, x_e, y_e = project_view_point_to_equirectangular(
+                            x_view, y_view, view, face_size, w, h
+                        )
                         x_vals.append(float(x_e))
                         y_vals.append(float(y_e))
 
@@ -351,15 +604,15 @@ def cubemap_sliding_detection(
                     y_equirect_min = int(np.clip(np.floor(y_vals.min()), 0, h - 1))
                     y_equirect_max = int(np.clip(np.ceil(y_vals.max()), 0, h - 1))
 
-                    x_center_face = (x1_face + x2_face) * 0.5
-                    y_center_face = (y1_rel + y2_rel) * 0.5
-                    u_center = 2.0 * x_center_face / face_size - 1.0
-                    v_center = 1.0 - 2.0 * y_center_face / face_size
-                    cx, cy, cz = cubemap_face_xyz(u_center, v_center, face_id)
-                    phi_center, lat_center, x_center, y_center = xyz_to_equirectangular(cx, cy, cz, w, h)
+                    x_center_view = (x1_view + x2_view) * 0.5
+                    y_center_view = (y1_rel + y2_rel) * 0.5
+                    phi_center, lat_center, x_center, y_center = project_view_point_to_equirectangular(
+                        x_center_view, y_center_view, view, face_size, w, h
+                    )
                     x_equirect_c = int(np.clip(round(float(x_center)), 0, w - 1))
                     y_equirect_c = int(np.clip(round(float(y_center)), 0, h - 1))
 
+                    view_label = view.get("face", view_idx)
                     all_detections.append({
                         'x1': max(0, min(x_equirect_min, w-1)),
                         'y1': max(0, min(y_equirect_min, h-1)),
@@ -367,7 +620,9 @@ def cubemap_sliding_detection(
                         'y2': max(0, min(y_equirect_max, h-1)),
                         'conf': float(conf_score),
                         'class': cls_name,
-                        'face_id': face_id,
+                        'face_id': view_label,
+                        'view_name': view["name"],
+                        'view_type': view["type"],
                         '_phi': phi_center,
                         '_lat': lat_center,
                         '_x_c': x_equirect_c,
@@ -376,15 +631,30 @@ def cubemap_sliding_detection(
 
             x_start += step_w
 
-    # After ALL faces — call NMS once on all detections
-    nms_detections = non_max_suppression_sphere(
+    if view_debug_path:
+        debug_grid = make_view_debug_grid(view_debug_images, view_debug_names)
+        if debug_grid is not None:
+            debug_dir = os.path.dirname(view_debug_path)
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(view_debug_path, debug_grid)
+
+    clustered_detections = cluster_view_detections(
         all_detections,
+        angle_threshold_deg=max(nms_angle_threshold_deg, 8.0),
+        iou_threshold=min(nms_iou_threshold, 0.10),
+        containment_threshold=min(nms_containment_threshold, 0.30),
+    )
+
+    # After ALL views — call NMS once on clustered representatives.
+    nms_detections = non_max_suppression_sphere(
+        clustered_detections,
         angle_threshold_deg=nms_angle_threshold_deg,
         iou_threshold=nms_iou_threshold,
         containment_threshold=nms_containment_threshold,
     )
-    face_ids_set = set(d['face_id'] for d in all_detections)
-    print(f"[debug] Total raw: {len(all_detections)}, After hybrid NMS: {len(nms_detections)} detections, faces={face_ids_set}")
+    view_names_set = set(d.get('view_name', d.get('face_id')) for d in all_detections)
+    print(f"[debug] Total raw: {len(all_detections)}, After cluster: {len(clustered_detections)}, After hybrid NMS: {len(nms_detections)} detections, views={view_names_set}")
 
     visualization = frame.copy()
     color = (255, 165, 0)
@@ -392,7 +662,7 @@ def cubemap_sliding_detection(
     if nms_detections:
         for det in nms_detections:
             cv2.rectangle(visualization, (det['x1'], det['y1']), (det['x2'], det['y2']), color, 2)
-            cv2.putText(visualization, f"{det['class']} {det['conf']:.2f} face{det['face_id']}",
+            cv2.putText(visualization, f"{det['class']} {det['conf']:.2f} {det.get('view_name', 'face' + str(det['face_id']))}",
                        (det['x1'], det['y1'] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             cx = (det['x1'] + det['x2']) // 2
             cy = (det['y1'] + det['y2']) // 2
@@ -442,6 +712,8 @@ def process_360_video(
         nms_angle_threshold_deg: 球面中心距离NMS阈值（度）
         nms_iou_threshold: 平面IoU NMS阈值
         nms_containment_threshold: 小框包含率NMS阈值
+        enable_extra_views: 是否追加水平/上下 overlap perspective views
+        view_debug_path: 如果提供，保存本帧所有检测 view 的拼图
         save_frames: 是否保存帧
         debug_vis: 是否启用调试可视化（立方体面映射验证）
         debug_dir: 调试可视化输出目录

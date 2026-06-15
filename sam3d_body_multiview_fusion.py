@@ -41,9 +41,9 @@ except Exception:
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 CONFIG = {
-    "video_path": "/mnt/dataset/skiing/raw_new/kimura2_360.mp4",
-    "bbox_json_path": "/mnt/dataset/skiing/raw_new/kimura2_360_cotracker_bboxes.json",
-    "output_dir": "/mnt/dataset/skiing/raw_new/sam3d_body_multiview",
+    "video_path": "/mnt/dataset/skiing/360test/kimura2_360.mp4",
+    "bbox_json_path": "/mnt/dataset/skiing/360tracker_outputs/kimura2_360/kimura2_360_cotracker_selfie_yolo_bboxes.json",
+    "output_dir": "/mnt/dataset/skiing/sam3d_body_multiview",
     "view_width": 768,
     "view_height": 768,
     "hfov_deg": 90.0,
@@ -72,14 +72,21 @@ CONFIG = {
     "sam3d_checkpoint_path": "/mnt/dataset/skiing/checkpoints/sam-3d-body-dinov3/model.ckpt",
     "sam3d_mhr_path": "/mnt/dataset/skiing/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt",
     "sam3d_hf_repo": "facebook/sam-3d-body-dinov3",
-    # Empty by default because multiview fusion supplies tracked bboxes.
-    # Direct full-frame comparison can set this to "vitdet" or "sam3".
+    # Optional internal detector settings. Multiview normally supplies tracked
+    # bboxes, so these are only used when SAM3D runs without provided bboxes.
     "sam3d_detector_name": "",
     "sam3d_detector_path": "",
     "sam3d_detector_bbox_thr": 0.5,
     "sam3d_detector_nms_thr": 0.3,
-    "sam3d_device": "auto",
-    "sam3d_inference_type": "full",
+    # Auto uses all visible CUDA devices. The pool creates independent
+    # estimators, so each estimator owns its SAM3D state and processes its view
+    # queue serially. On dual 24GB GPUs, 2 estimators per device is a practical
+    # default; raise this only after checking free VRAM.
+    "sam3d_devices": "auto",
+    "sam3d_estimators_per_device": 4,
+    # Body mode is more stable for bbox-guided multiview pose than full mode,
+    # which can fail in hand/ray-conditioning branches on synthetic views.
+    "sam3d_inference_type": "body",
     "sam3d_use_known_intrinsics": True,
     "sam3d_use_camera_translation": True,
     # 0 means auto: run all selected perspective views concurrently.
@@ -94,14 +101,17 @@ CONFIG = {
 
 
 def wrap_lon(lon: float) -> float:
+    """Wrap longitude to the [-pi, pi) interval."""
     return (lon + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def clamp_lat(lat: float, eps: float = 1e-4) -> float:
+    """Clamp latitude away from the exact poles to keep projections finite."""
     return float(np.clip(lat, -math.pi / 2.0 + eps, math.pi / 2.0 - eps))
 
 
 def bbox_center_to_lon_lat(bbox_xyxy: list[int | float], width: int, height: int) -> tuple[float, float]:
+    """Convert a bbox center in equirectangular pixels to spherical longitude and latitude."""
     x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
     cx = (x1 + x2) * 0.5
     cy = (y1 + y2) * 0.5
@@ -110,7 +120,55 @@ def bbox_center_to_lon_lat(bbox_xyxy: list[int | float], width: int, height: int
     return wrap_lon(lon), clamp_lat(lat)
 
 
+def pixel_center_to_lon_lat(center_xy: list[int | float], width: int, height: int) -> tuple[float, float] | None:
+    """Convert one equirectangular pixel center to spherical longitude and latitude."""
+    if center_xy is None or len(center_xy) < 2:
+        return None
+    x = float(center_xy[0])
+    y = float(center_xy[1])
+    if not np.isfinite(x) or not np.isfinite(y):
+        return None
+    lon = ((x % float(width)) / float(width) - 0.5) * 2.0 * math.pi
+    lat = (0.5 - np.clip(y, 0.0, max(float(height - 1), 0.0)) / float(height)) * math.pi
+    return wrap_lon(lon), clamp_lat(float(lat))
+
+
+def track_points_center_to_lon_lat(points_xy: list[list[int | float]], width: int, height: int) -> tuple[float, float] | None:
+    """Estimate a seam-aware spherical center from tracked equirectangular points."""
+    if not points_xy:
+        return None
+    pts = np.asarray(points_xy, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return None
+    finite = np.isfinite(pts[:, :2]).all(axis=1)
+    pts = pts[finite, :2]
+    if len(pts) == 0:
+        return None
+
+    lon = ((np.mod(pts[:, 0], float(width)) / float(width)) - 0.5) * 2.0 * math.pi
+    mean_lon = math.atan2(float(np.sin(lon).mean()), float(np.cos(lon).mean()))
+    center_y = float(np.median(np.clip(pts[:, 1], 0.0, max(float(height - 1), 0.0))))
+    lat = (0.5 - center_y / float(height)) * math.pi
+    return wrap_lon(mean_lon), clamp_lat(float(lat))
+
+
+def person_center_to_lon_lat(box_record: dict[str, Any], width: int, height: int) -> tuple[float, float, str]:
+    """Choose the best available center direction for multiview generation."""
+    point_source = str(box_record.get("track_points_source") or box_record.get("ref_source") or "").lower()
+    if point_source == "pose":
+        point_center = track_points_center_to_lon_lat(box_record.get("track_points_xy") or [], width, height)
+        if point_center is not None:
+            return point_center[0], point_center[1], "pose"
+
+    bbox = box_record.get("bbox_xyxy") or box_record.get("box") or box_record.get("bbox")
+    if not bbox or len(bbox) != 4:
+        raise ValueError(f"box record missing bbox fields: {box_record}")
+    lon, lat = bbox_center_to_lon_lat(bbox, width, height)
+    return lon, lat, "bbox"
+
+
 def lon_lat_to_xyz(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert spherical longitude and latitude arrays to unit 3D directions."""
     cos_lat = np.cos(lat)
     x = cos_lat * np.sin(lon)
     y = np.sin(lat)
@@ -119,6 +177,7 @@ def lon_lat_to_xyz(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.nda
 
 
 def camera_basis(yaw: float, pitch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build right, up, and forward basis vectors for a perspective view."""
     forward = np.array([
         math.cos(pitch) * math.sin(yaw),
         math.sin(pitch),
@@ -143,11 +202,14 @@ def equirect_to_perspective(
     hfov_deg: float,
     vfov_deg: float,
 ) -> np.ndarray:
+    """Render a perspective crop from an equirectangular frame."""
     h, w = frame_bgr.shape[:2]
     hfov = math.radians(hfov_deg)
     vfov = math.radians(vfov_deg)
     right, up, forward = camera_basis(yaw, pitch)
 
+    # Pixel centers are cast as rays in the virtual perspective camera, then
+    # converted back to equirectangular lon/lat coordinates for OpenCV remap.
     xs = (np.arange(out_w, dtype=np.float32) + 0.5) / out_w
     ys = (np.arange(out_h, dtype=np.float32) + 0.5) / out_h
     px, py = np.meshgrid(xs, ys)
@@ -171,6 +233,7 @@ def equirect_to_perspective(
 
 
 def sample_bbox_edges(bbox_xyxy: list[int | float], samples_per_edge: int) -> np.ndarray:
+    """Sample points along a bbox boundary for projection into each perspective view."""
     x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
     n = max(2, int(samples_per_edge))
     xs = np.linspace(x1, x2, n)
@@ -193,6 +256,7 @@ def project_equirect_points_to_view(
     hfov_deg: float,
     vfov_deg: float,
 ) -> np.ndarray:
+    """Project equirectangular pixel points into a perspective view."""
     hfov = math.radians(hfov_deg)
     vfov = math.radians(vfov_deg)
     right, up, forward = camera_basis(yaw, pitch)
@@ -233,6 +297,10 @@ def project_bbox_to_view(
     sample_points: int,
     min_size: int,
 ) -> list[int] | None:
+    """Project an equirectangular bbox into one perspective view and clip it to image bounds."""
+    # Projecting only the four corners is unstable on equirectangular bboxes,
+    # especially near the seam. Sampling the boundary better approximates the
+    # visible extent after the spherical-to-perspective warp.
     edge_points = sample_bbox_edges(bbox_xyxy, sample_points)
     projected = project_equirect_points_to_view(
         edge_points, frame_w, frame_h, yaw, pitch, out_w, out_h, hfov_deg, vfov_deg
@@ -251,6 +319,7 @@ def project_bbox_to_view(
 
 
 def read_bbox_json(path: Path) -> dict[str, Any]:
+    """Load the tracked bbox JSON used to drive multiview view generation."""
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if "frames" not in data:
@@ -259,6 +328,7 @@ def read_bbox_json(path: Path) -> dict[str, Any]:
 
 
 def open_video(path: Path) -> cv2.VideoCapture:
+    """Open a video path and raise a clear error if OpenCV cannot read it."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise FileNotFoundError(f"cannot open video: {path}")
@@ -266,6 +336,7 @@ def open_video(path: Path) -> cv2.VideoCapture:
 
 
 def read_video_frame(cap: cv2.VideoCapture, frame_number_1based: int) -> np.ndarray:
+    """Read one 1-based frame from an opened video capture."""
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_number_1based - 1))
     ok, frame = cap.read()
     if not ok or frame is None:
@@ -274,18 +345,74 @@ def read_video_frame(cap: cv2.VideoCapture, frame_number_1based: int) -> np.ndar
 
 
 def normalize_command_path(path: Path) -> str:
+    """Return a path string suitable for command templates and JSON output."""
     return str(path.resolve())
 
 
+def resolve_video_output_dir(output_root: Path, video_path: Path) -> Path:
+    """Return the per-video output directory under the configured output root."""
+    video_name = video_path.stem or video_path.name
+    return output_root / video_name
+
+
+def resolve_sam3d_devices(
+    value: str | list[str] | None,
+    cuda_available: bool | None = None,
+    cuda_count: int | None = None,
+) -> list[str]:
+    """Resolve SAM3D runner devices from auto or a comma-separated device list."""
+    if isinstance(value, list):
+        devices = [str(item).strip() for item in value if str(item).strip()]
+        return devices or ["cpu"]
+
+    text = str(value or "auto").strip()
+    if not text or text.lower() == "auto":
+        if cuda_available is None or cuda_count is None:
+            try:
+                import torch
+
+                cuda_available = bool(torch.cuda.is_available())
+                cuda_count = int(torch.cuda.device_count()) if cuda_available else 0
+            except Exception:
+                cuda_available = False
+                cuda_count = 0
+        if cuda_available and int(cuda_count or 0) > 0:
+            return [f"cuda:{idx}" for idx in range(int(cuda_count or 0))]
+        return ["cpu"]
+
+    devices = [item.strip() for item in text.split(",") if item.strip()]
+    return devices or ["cpu"]
+
+
+def expand_sam3d_runner_devices(devices: list[str], estimators_per_device: int, max_runners: int) -> list[str]:
+    """Expand physical devices into per-estimator device assignments."""
+    repeats = max(1, int(estimators_per_device))
+    expanded = []
+    for device in devices or ["cpu"]:
+        expanded.extend([device] * repeats)
+    cap = max(1, int(max_runners))
+    return expanded[:cap] or ["cpu"]
+
+
 def view_output_dir(person_dir: Path, view_idx: int) -> Path:
+    """Return the output directory for one person-view pair."""
     return person_dir / "views" / f"view_{view_idx:02d}"
 
 
+def resolve_sam3d_result_output_dir(person_dir: Path, view_idx: int) -> Path:
+    """Return the video-level SAM3D result directory for one person-view pair."""
+    frame_dir = person_dir.parent
+    output_dir = frame_dir.parent
+    return output_dir / "sam3d_results" / frame_dir.name / person_dir.name / f"view_{view_idx:02d}"
+
+
 def fused_output_dir(person_dir: Path) -> Path:
+    """Return the directory that stores fused outputs for one person track."""
     return person_dir / "fused"
 
 
 def copy_if_exists(src: Path | None, dst: Path) -> None:
+    """Copy an optional file when the source path exists."""
     if src is None or not src.exists():
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -295,42 +422,55 @@ def copy_if_exists(src: Path | None, dst: Path) -> None:
 
 
 def canonicalize_view_assets(person_dir: Path, view: dict[str, Any]) -> dict[str, Any]:
+    """Copy generated view assets to stable filenames and update metadata."""
     view_idx = int(view["view_index"])
     view_dir = view_output_dir(person_dir, view_idx)
     view_dir.mkdir(parents=True, exist_ok=True)
+    sam_result_dir = resolve_sam3d_result_output_dir(person_dir, view_idx)
+    sam_result_dir.mkdir(parents=True, exist_ok=True)
 
     old_image = Path(view["image_path"]) if view.get("image_path") else None
     old_vis = Path(view["vis_path"]) if view.get("vis_path") else None
     old_bbox = Path(view["bbox_json_path"]) if view.get("bbox_json_path") else None
     old_sam = Path(view["sam3d_output_path"]) if view.get("sam3d_output_path") else None
+    old_sam_npz = Path(view["sam3d_npz_path"]) if view.get("sam3d_npz_path") else None
 
     image_path = view_dir / "frame.jpg"
     vis_path = view_dir / "frame_bbox.jpg"
     bbox_json_path = view_dir / "bbox.json"
-    sam_output_path = view_dir / "sam3d.json"
+    sam_output_path = sam_result_dir / "sam3d.json"
+    sam_npz_path = sam_result_dir / "sam3d.npz"
 
     copy_if_exists(old_image, image_path)
     copy_if_exists(old_vis, vis_path)
     copy_if_exists(old_bbox, bbox_json_path)
     copy_if_exists(old_sam, sam_output_path)
+    copy_if_exists(old_sam_npz, sam_npz_path)
 
     view["view_dir"] = normalize_command_path(view_dir)
     view["image_path"] = normalize_command_path(image_path)
     view["vis_path"] = normalize_command_path(vis_path)
     view["bbox_json_path"] = normalize_command_path(bbox_json_path)
     view["sam3d_output_path"] = normalize_command_path(sam_output_path)
+    view["sam3d_npz_path"] = normalize_command_path(sam_npz_path)
     return view
 
 
 def write_person_result(person_dir: Path, result: dict[str, Any]) -> None:
+    """Write one track-level multiview result JSON and fused keypoint NPZ files."""
+    person_dir.mkdir(parents=True, exist_ok=True)
     root_path = person_dir / "fused_keypoints3d.json"
     root_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    save_fused_keypoints_npz(result, person_dir / "fused_keypoints3d_world.npz")
+
     fused_dir = fused_output_dir(person_dir)
     fused_dir.mkdir(parents=True, exist_ok=True)
     (fused_dir / "fused_keypoints3d.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    save_fused_keypoints_npz(result, fused_dir / "fused_keypoints3d_world.npz")
 
 
 def write_view_bbox_json(path: Path, bbox_xyxy: list[int], image_path: Path, meta: dict[str, Any]) -> None:
+    """Write the bbox handoff JSON expected by SAM3D Body for one view."""
     payload = {
         "image_path": normalize_command_path(image_path),
         "bbox_format": "xyxy",
@@ -347,6 +487,7 @@ def run_sam3d_body_command(
     output_json_path: Path,
     bbox_xyxy: list[int],
 ) -> None:
+    """Run an external SAM3D command-template fallback for one view."""
     command = command_template.format(
         image=normalize_command_path(image_path),
         bbox_json=normalize_command_path(bbox_json_path),
@@ -363,6 +504,7 @@ def run_sam3d_body_command(
 
 
 def extract_keypoints3d(payload: Any) -> np.ndarray | None:
+    """Extract a 3D keypoint array from a flexible SAM3D-style payload."""
     if isinstance(payload, list):
         arr = payload
     elif isinstance(payload, dict):
@@ -386,6 +528,10 @@ def extract_keypoints3d(payload: Any) -> np.ndarray | None:
 
 
 def extract_sam3d_camera_keypoints(payload: Any, use_camera_translation: bool = True) -> np.ndarray | None:
+    """Extract camera-space SAM3D keypoints, optionally adding camera translation."""
+    # Official SAM3D outputs pred_keypoints_3d in a root-relative body frame.
+    # Adding pred_cam_t places the body in the view camera frame, which is the
+    # coordinate space needed before rotating into the shared 360 world frame.
     if (
         use_camera_translation
         and isinstance(payload, dict)
@@ -407,12 +553,14 @@ def extract_sam3d_camera_keypoints(payload: Any, use_camera_translation: bool = 
 
 
 def load_sam3d_keypoints(path: Path, use_camera_translation: bool = True) -> np.ndarray | None:
+    """Load camera-space keypoints from a SAM3D output JSON path."""
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     return extract_sam3d_camera_keypoints(payload, use_camera_translation=use_camera_translation)
 
 
 def load_sam3d_payload(path: Path) -> dict[str, Any] | None:
+    """Load a SAM3D output payload if the JSON file exists."""
     if not path.exists():
         return None
     with path.open("r", encoding="utf-8") as f:
@@ -420,6 +568,7 @@ def load_sam3d_payload(path: Path) -> dict[str, Any] | None:
 
 
 def extract_keypoints2d(payload: Any) -> np.ndarray | None:
+    """Extract 2D keypoints from a flexible SAM3D output payload."""
     if not isinstance(payload, dict):
         return None
     arr = payload.get("keypoints2d")
@@ -439,6 +588,7 @@ def extract_keypoints2d(payload: Any) -> np.ndarray | None:
 
 
 def numpy_to_jsonable(value: Any) -> Any:
+    """Recursively convert numpy values into JSON-serializable Python objects."""
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, (np.floating, np.integer)):
@@ -450,7 +600,85 @@ def numpy_to_jsonable(value: Any) -> Any:
     return value
 
 
+def json_numeric_array(value: Any) -> np.ndarray | None:
+    """Convert nested JSON-style numeric data to a float array, using NaN for missing values."""
+    try:
+        arr = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if arr.dtype == object or arr.ndim == 0:
+        return None
+    return arr
+
+
+def collect_npz_numeric_arrays(prefix: str, value: Any, arrays: dict[str, np.ndarray]) -> None:
+    """Collect numeric leaves from a JSON-style payload with stable NPZ names."""
+    direct = json_numeric_array(value)
+    if direct is not None:
+        arrays[prefix] = direct
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            safe_key = str(key).replace("/", "_").replace(" ", "_")
+            collect_npz_numeric_arrays(f"{prefix}_{safe_key}", child, arrays)
+        return
+    if isinstance(value, list):
+        for idx, child in enumerate(value):
+            collect_npz_numeric_arrays(f"{prefix}_{idx}", child, arrays)
+
+
+def save_sam3d_payload_npz(payload: dict[str, Any], output_path: Path) -> Path:
+    """Save a SAM3D payload as compressed NPZ, preserving the full payload as JSON text."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {
+        "payload_json": np.asarray(json.dumps(payload, indent=2), dtype=np.str_),
+    }
+    for key in (
+        "bbox_xyxy",
+        "detected_bboxes_xyxy",
+        "keypoints3d",
+        "keypoints3d_camera",
+        "keypoints2d",
+        "joint_coords",
+    ):
+        if key in payload:
+            arr = json_numeric_array(payload[key])
+            if arr is not None:
+                arrays[key] = arr
+    if "outputs" in payload:
+        collect_npz_numeric_arrays("outputs", payload["outputs"], arrays)
+    np.savez_compressed(output_path, **arrays)
+    return output_path
+
+
+def save_fused_keypoints_npz(result: dict[str, Any], output_path: Path) -> Path | None:
+    """Save fused world keypoints for one track as compressed NPZ."""
+    fused = result.get("fused_keypoints3d_world")
+    if not fused:
+        return None
+    arr = np.asarray(
+        [[np.nan if value is None else float(value) for value in row] for row in fused],
+        dtype=np.float64,
+    )
+    metadata = {
+        "frame_number": result.get("frame_number"),
+        "track_id": result.get("track_id"),
+        "source_bbox_xyxy": result.get("source_bbox_xyxy"),
+        "num_views": result.get("num_views"),
+        "num_fused_views": result.get("num_fused_views"),
+        "coordinate_system": "world: x=right/east at yaw=0, y=up, z=front at yaw=0; lon=atan2(x,z)",
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        fused_keypoints3d_world=arr,
+        metadata_json=np.asarray(json.dumps(metadata, indent=2), dtype=np.str_),
+    )
+    return output_path
+
+
 def make_camera_intrinsics(width: int, height: int, hfov_deg: float, vfov_deg: float):
+    """Create a pinhole camera intrinsic matrix from image size and field of view."""
     import torch
 
     fx = width / (2.0 * math.tan(math.radians(hfov_deg) * 0.5))
@@ -464,7 +692,9 @@ def make_camera_intrinsics(width: int, height: int, hfov_deg: float, vfov_deg: f
 
 
 class Sam3DBodyDirectRunner:
+    """Thin wrapper around the vendored official SAM3D Body direct API."""
     def __init__(self, config: dict[str, Any]):
+        """Initialize the direct SAM3D runner and cache model configuration."""
         repo = str(config.get("sam3d_repo") or "").strip()
         if repo:
             repo_path = Path(repo).expanduser().resolve()
@@ -514,6 +744,7 @@ class Sam3DBodyDirectRunner:
         self.config = config
 
     def run(self, image_path: Path, bbox_xyxy: list[int] | None, output_json_path: Path) -> np.ndarray | None:
+        """Run SAM3D Body on one view image with an optional bbox prompt."""
         import torch
 
         bboxes = None if bbox_xyxy is None else np.asarray([bbox_xyxy], dtype=np.float32)
@@ -592,22 +823,47 @@ class Sam3DBodyDirectRunner:
                 payload["joint_coords"] = numpy_to_jsonable(first["pred_joint_coords"])
 
         output_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        save_sam3d_payload_npz(payload, output_json_path.with_suffix(".npz"))
         return extract_sam3d_camera_keypoints(
             payload,
             use_camera_translation=self.config.get("sam3d_use_camera_translation", True),
         )
 
 
+def create_sam3d_runner_pool(config: dict[str, Any], max_runners: int) -> list[Sam3DBodyDirectRunner]:
+    """Create a SAM3D estimator pool across selected devices."""
+    devices = resolve_sam3d_devices(config.get("sam3d_devices"))
+    runner_devices = expand_sam3d_runner_devices(
+        devices,
+        int(config.get("sam3d_estimators_per_device", 1)),
+        max_runners,
+    )
+    pool_size = len(runner_devices)
+    runners = []
+    for idx, device in enumerate(runner_devices):
+        runner_config = dict(config)
+        runner_config["sam3d_device"] = device
+        print(f"Loading SAM3D estimator {idx + 1}/{pool_size} on {device}")
+        runners.append(Sam3DBodyDirectRunner(runner_config))
+    return runners
+
+
 def camera_keypoints_to_world(kpts_cam: np.ndarray, yaw: float, pitch: float, y_axis: str) -> np.ndarray:
+    """Rotate camera-space SAM3D keypoints into the shared world coordinate frame."""
     right, up, forward = camera_basis(yaw, pitch)
     xyz = kpts_cam[:, :3].copy()
     if y_axis == "down":
         xyz[:, 1] *= -1.0
+    # The perspective view has only a rotation relative to the equirectangular
+    # sphere; there is no estimated global translation between views. This makes
+    # the fused output a root/camera-scale world orientation, not metric scene
+    # localization.
     world_xyz = xyz[:, [0]] * right + xyz[:, [1]] * up + xyz[:, [2]] * forward
     return np.concatenate([world_xyz, kpts_cam[:, 3:4]], axis=1)
 
 
 def fuse_keypoints_weighted(keypoints_world: list[np.ndarray], min_conf: float) -> np.ndarray | None:
+    """Fuse per-view world keypoints with confidence-weighted averaging."""
     if not keypoints_world:
         return None
     n_joints = min(k.shape[0] for k in keypoints_world)
@@ -627,6 +883,9 @@ def fuse_keypoints_weighted(keypoints_world: list[np.ndarray], min_conf: float) 
         if not weights:
             fused[joint_idx, :] = np.nan
             continue
+        # Confidence is used as a soft reliability score across nearby views.
+        # No geometric triangulation is done here because SAM3D already returns
+        # monocular 3D body estimates for each synthetic perspective crop.
         xyz_arr = np.stack(xyz_values, axis=0)
         w = np.asarray(weights, dtype=np.float64)
         fused[joint_idx, :3] = np.average(xyz_arr, axis=0, weights=w)
@@ -635,6 +894,7 @@ def fuse_keypoints_weighted(keypoints_world: list[np.ndarray], min_conf: float) 
 
 
 def keypoints_to_jsonable(kpts: np.ndarray | None) -> list[list[float]]:
+    """Convert keypoint arrays to JSON rows while preserving missing values."""
     if kpts is None:
         return []
     out = []
@@ -647,6 +907,7 @@ def keypoints_to_jsonable(kpts: np.ndarray | None) -> list[list[float]]:
 
 
 def jsonable_to_keypoints(rows: list[list[float]] | None) -> np.ndarray | None:
+    """Convert JSON keypoint rows back into a numpy array."""
     if not rows:
         return None
     parsed = []
@@ -660,6 +921,7 @@ def jsonable_to_keypoints(rows: list[list[float]] | None) -> np.ndarray | None:
 
 
 def load_mhr70_pose_info(sam3d_repo: str) -> dict[str, Any] | None:
+    """Load MHR70 pose metadata directly from the vendored SAM3D repo."""
     repo = str(sam3d_repo or "").strip()
     if repo:
         repo_path = Path(repo).expanduser().resolve()
@@ -683,6 +945,7 @@ def load_mhr70_pose_info(sam3d_repo: str) -> dict[str, Any] | None:
 
 
 def load_mhr70_visual_style(sam3d_repo: str) -> dict[str, Any]:
+    """Load skeleton edges, colors, and fallback style for visualization."""
     pose_info = load_mhr70_pose_info(sam3d_repo)
     if pose_info is None:
         return {"edges": [], "edge_colors": [], "point_colors": None}
@@ -723,6 +986,7 @@ def load_mhr70_visual_style(sam3d_repo: str) -> dict[str, Any]:
 
 
 def finite_keypoint_mask(kpts: np.ndarray, min_conf: float = 0.0) -> np.ndarray:
+    """Return a mask for keypoints with finite coordinates and enough confidence."""
     if kpts is None or kpts.size == 0:
         return np.zeros(0, dtype=bool)
     mask = np.isfinite(kpts[:, :3]).all(axis=1)
@@ -732,6 +996,7 @@ def finite_keypoint_mask(kpts: np.ndarray, min_conf: float = 0.0) -> np.ndarray:
 
 
 def set_axes_equal(ax, pts: np.ndarray) -> None:
+    """Set equal 3D plot axes around the visible keypoint cloud."""
     if pts.size == 0:
         return
     mins = pts.min(axis=0)
@@ -744,6 +1009,7 @@ def set_axes_equal(ax, pts: np.ndarray) -> None:
 
 
 def keypoints3d_to_plot_coords(kpts: np.ndarray, plot_space: str) -> tuple[np.ndarray, tuple[str, str, str], tuple[float, float]]:
+    """Convert keypoints into the selected plotting coordinate convention."""
     coords = np.asarray(kpts[:, :3], dtype=np.float64)
     if plot_space == "camera":
         # SAM3D camera convention follows image projection: X right, Y down, Z forward.
@@ -766,6 +1032,7 @@ def draw_keypoints3d_axis(
     min_conf: float,
     plot_space: str = "raw",
 ) -> None:
+    """Draw a 3D skeleton and optional joint labels on an axis."""
     mask = finite_keypoint_mask(kpts, min_conf)
     if not np.any(mask):
         ax.set_title(title + "\n(no valid kpts)")
@@ -808,6 +1075,7 @@ def save_keypoints3d_plot(
     min_conf: float,
     plot_space: str = "raw",
 ) -> str | None:
+    """Save a 3D skeleton plot for one keypoint set."""
     if kpts is None:
         return None
     import matplotlib
@@ -825,11 +1093,13 @@ def save_keypoints3d_plot(
 
 
 def log_progress(prefix: str, message: str, verbose: bool = True) -> None:
+    """Print progress messages when verbose mode is enabled."""
     if verbose:
         print(f"[{prefix}] {message}", flush=True)
 
 
 def track_color_rgb01(track_id: int) -> np.ndarray:
+    """Return a deterministic RGB color for a track ID."""
     palette = np.array([
         [0.90, 0.18, 0.20],
         [0.16, 0.55, 0.95],
@@ -845,6 +1115,7 @@ def track_color_rgb01(track_id: int) -> np.ndarray:
 
 
 def track_id_from_dir(track_dir: Path) -> int:
+    """Parse a numeric track ID from a track output directory name."""
     try:
         return int(track_dir.name.split("_", 1)[1])
     except (IndexError, ValueError):
@@ -852,6 +1123,7 @@ def track_id_from_dir(track_dir: Path) -> int:
 
 
 def collect_frame_world_tracks(frame_dir: Path, min_conf: float = 0.0, verbose: bool = False) -> list[dict[str, Any]]:
+    """Collect fused world keypoints for all tracks in one frame directory."""
     tracks = []
     track_dirs = sorted(frame_dir.glob("track_*"), key=track_id_from_dir)
     if verbose:
@@ -901,6 +1173,7 @@ def collect_frame_world_tracks(frame_dir: Path, min_conf: float = 0.0, verbose: 
 
 
 def world_keypoints_to_equirectangular_pixels(kpts: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Project world-space keypoints back to equirectangular pixel coordinates."""
     xyz = np.asarray(kpts[:, :3], dtype=np.float64)
     pixels = np.full((len(xyz), 2), np.nan, dtype=np.float64)
     finite = np.isfinite(xyz).all(axis=1)
@@ -925,6 +1198,7 @@ def draw_frame_tracks_overlay(
     height: int,
     min_conf: float,
 ) -> None:
+    """Draw all fused tracks back onto the original 360 frame."""
     from matplotlib import patches
 
     for track in tracks:
@@ -981,6 +1255,7 @@ def draw_frame_tracks_world_axis(
     show_indices: bool,
     min_conf: float,
 ) -> None:
+    """Draw all frame tracks in the world-coordinate 3D plot."""
     if not tracks:
         ax.set_title("world 3D tracks\n(no valid tracks)")
         return
@@ -1035,6 +1310,7 @@ def draw_frame_tracks_topdown_axis(
     point_colors: np.ndarray | None,
     min_conf: float,
 ) -> None:
+    """Draw a top-down XZ plot for all frame tracks."""
     if not tracks:
         ax.set_title("world XZ top-down\n(no valid tracks)")
         return
@@ -1086,6 +1362,7 @@ def write_frame_tracks_metadata(
     frame_title: str | None,
     min_conf: float,
 ) -> str:
+    """Write frame-level visualization metadata next to rendered images."""
     metadata_path = output_path.with_suffix(".json")
     metadata = {
         "image_path": normalize_command_path(output_path),
@@ -1113,6 +1390,7 @@ def save_frame_tracks_world_visualization(
     frame_title: str | None = None,
     verbose: bool = False,
 ) -> str | None:
+    """Save frame-level overlay, world plot, top-down plot, and metadata."""
     if frame_bgr is None or not tracks:
         if verbose:
             reason = "missing frame" if frame_bgr is None else "no valid tracks"
@@ -1154,6 +1432,7 @@ def visualize_existing_frame_output(
     config: dict[str, Any],
     verbose: bool = False,
 ) -> dict[str, Any]:
+    """Regenerate frame-level visualizations from already written fused outputs."""
     frame_dir = output_dir / f"frame_{frame_number:06d}"
     if verbose:
         log_progress("frame-vis", f"start frame {frame_number:06d}: {frame_dir}")
@@ -1180,6 +1459,7 @@ def visualize_existing_frame_output(
 
 
 def rgb01_to_bgr255(color: np.ndarray | list[float]) -> tuple[int, int, int]:
+    """Convert RGB colors in 0-1 or 0-255 range to OpenCV BGR uint8 tuples."""
     arr = np.asarray(color, dtype=np.float64)
     if arr.max(initial=0.0) <= 1.0:
         arr = arr * 255.0
@@ -1198,6 +1478,7 @@ def save_keypoints2d_overlay(
     show_indices: bool,
     min_conf: float,
 ) -> str | None:
+    """Save a 2D skeleton overlay for one SAM3D view output."""
     if kpts2d is None or not image_path.exists():
         return None
     image = cv2.imread(str(image_path))
@@ -1248,6 +1529,7 @@ def save_view_frames_grid(
     tile_width: int = 384,
     cols: int = 4,
 ) -> str | None:
+    """Save a tiled grid of all perspective view images for one track."""
     tiles = []
     for view in sorted(views, key=lambda item: int(item.get("view_index", 0))):
         image_path = Path(view.get(image_key, ""))
@@ -1300,6 +1582,7 @@ def save_multiview_keypoints_grid(
     min_conf: float,
     plot_space: str = "raw",
 ) -> str | None:
+    """Save a tiled grid of per-view 3D keypoint plots."""
     if not per_view:
         return None
     import matplotlib
@@ -1328,6 +1611,7 @@ def save_multiview_keypoints_grid(
 
 
 def view_image_for_summary(view: dict[str, Any]) -> Path | None:
+    """Return the best available image path for a view summary tile."""
     for key in ("kpts2d_vis_path", "vis_path", "image_path"):
         value = view.get(key)
         if value and Path(value).exists():
@@ -1352,6 +1636,7 @@ def save_track_fused_summary_visualization(
     min_conf: float,
     title: str,
 ) -> str | None:
+    """Save a compact summary of views, fused 3D pose, and metadata for one track."""
     if fused is None:
         return None
     import matplotlib
@@ -1428,6 +1713,7 @@ def visualize_person_keypoints(
     fused: np.ndarray | None,
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    """Create per-track visualizations for view-level and fused SAM3D outputs."""
     canonical_views = [canonicalize_view_assets(person_dir, view) for view in views]
     views_dir = person_dir / "views"
     views_dir.mkdir(parents=True, exist_ok=True)
@@ -1587,6 +1873,7 @@ def visualize_person_keypoints(
 
 
 def visualize_existing_person_output(person_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Regenerate per-track visualizations from existing output JSON files."""
     fused_path = person_dir / "fused_keypoints3d.json"
     if not fused_path.exists():
         raise FileNotFoundError(f"missing fused output: {fused_path}")
@@ -1626,15 +1913,22 @@ def build_person_views(
     track_id: int,
     person_dir: Path,
     config: dict[str, Any],
+    box_record: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """Build perspective view crops and projected bboxes for one tracked person."""
     frame_h, frame_w = frame.shape[:2]
-    center_yaw, center_pitch = bbox_center_to_lon_lat(source_bbox, frame_w, frame_h)
+    center_record = dict(box_record or {})
+    center_record["bbox_xyxy"] = source_bbox
+    center_yaw, center_pitch, center_source = person_center_to_lon_lat(center_record, frame_w, frame_h)
     view_records = []
 
     selected_view_indices = config.get("view_indices")
     if selected_view_indices is not None:
         selected_view_indices = set(int(v) for v in selected_view_indices)
 
+    # Generate nearby perspective crops around the tracked bbox center. Each
+    # crop keeps its yaw/pitch metadata so camera-space SAM3D output can be
+    # rotated back into a shared world coordinate frame later.
     for view_idx, (yaw_offset_deg, pitch_offset_deg) in enumerate(config["view_offsets_deg"]):
         if selected_view_indices is not None and view_idx not in selected_view_indices:
             continue
@@ -1668,10 +1962,13 @@ def build_person_views(
 
         view_dir = view_output_dir(person_dir, view_idx)
         view_dir.mkdir(parents=True, exist_ok=True)
+        sam_result_dir = resolve_sam3d_result_output_dir(person_dir, view_idx)
+        sam_result_dir.mkdir(parents=True, exist_ok=True)
         image_path = view_dir / "frame.jpg"
         vis_path = view_dir / "frame_bbox.jpg"
         bbox_json_path = view_dir / "bbox.json"
-        sam_output_path = view_dir / "sam3d.json"
+        sam_output_path = sam_result_dir / "sam3d.json"
+        sam_npz_path = sam_result_dir / "sam3d.npz"
         cv2.imwrite(str(image_path), image)
         if config["save_views"]:
             vis = image.copy()
@@ -1685,6 +1982,7 @@ def build_person_views(
             "view_index": int(view_idx),
             "center_yaw_deg": float(math.degrees(center_yaw)),
             "center_pitch_deg": float(math.degrees(center_pitch)),
+            "center_source": center_source,
             "yaw_deg": float(math.degrees(yaw)),
             "pitch_deg": float(math.degrees(pitch)),
             "yaw_offset_deg": float(yaw_offset_deg),
@@ -1699,6 +1997,7 @@ def build_person_views(
             "bbox_json_path": normalize_command_path(bbox_json_path),
             "bbox_xyxy": view_bbox,
             "sam3d_output_path": normalize_command_path(sam_output_path),
+            "sam3d_npz_path": normalize_command_path(sam_npz_path),
         })
     return view_records
 
@@ -1709,25 +2008,47 @@ def run_sam3d_for_view(
     sam3d_command: str | None,
     sam3d_runner: Sam3DBodyDirectRunner | None,
 ) -> np.ndarray | None:
+    """Run SAM3D Body for one generated perspective view."""
     image_path = Path(view["image_path"])
     bbox_json_path = Path(view["bbox_json_path"])
     sam_output_path = Path(view["sam3d_output_path"])
     view_idx = int(view["view_index"])
-    if sam3d_runner is not None:
-        print(f"    SAM3D Body direct API: view {view_idx}")
-        return sam3d_runner.run(image_path, view["bbox_xyxy"], sam_output_path)
-    if sam3d_command:
-        run_sam3d_body_command(
-            sam3d_command,
-            image_path,
-            bbox_json_path,
-            sam_output_path,
-            view["bbox_xyxy"],
-        )
-        return load_sam3d_keypoints(
-            sam_output_path,
-            use_camera_translation=config.get("sam3d_use_camera_translation", True),
-        )
+    try:
+        if sam3d_runner is not None:
+            print(f"    SAM3D Body direct API: view {view_idx}")
+            return sam3d_runner.run(image_path, view["bbox_xyxy"], sam_output_path)
+        if sam3d_command:
+            run_sam3d_body_command(
+                sam3d_command,
+                image_path,
+                bbox_json_path,
+                sam_output_path,
+                view["bbox_xyxy"],
+            )
+            payload = load_sam3d_payload(sam_output_path)
+            if payload is not None:
+                save_sam3d_payload_npz(payload, sam_output_path.with_suffix(".npz"))
+            return load_sam3d_keypoints(
+                sam_output_path,
+                use_camera_translation=config.get("sam3d_use_camera_translation", True),
+            )
+    except Exception as exc:
+        error_payload = {
+            "status": "failed",
+            "image_path": normalize_command_path(image_path),
+            "bbox_format": "xyxy",
+            "bbox_xyxy": [int(v) for v in view.get("bbox_xyxy", [])],
+            "view_index": view_idx,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        sam_output_path.parent.mkdir(parents=True, exist_ok=True)
+        sam_output_path.write_text(json.dumps(error_payload, indent=2), encoding="utf-8")
+        save_sam3d_payload_npz(error_payload, sam_output_path.with_suffix(".npz"))
+        view["sam3d_status"] = "failed"
+        view["sam3d_error"] = f"{type(exc).__name__}: {exc}"
+        print(f"    skip view {view_idx}: SAM3D failed ({type(exc).__name__}: {exc})")
+        return None
     return None
 
 
@@ -1735,30 +2056,66 @@ def run_sam3d_for_views(
     views: list[dict[str, Any]],
     config: dict[str, Any],
     sam3d_command: str | None,
-    sam3d_runner: Sam3DBodyDirectRunner | None,
+    sam3d_runner: Sam3DBodyDirectRunner | list[Sam3DBodyDirectRunner] | None,
 ) -> list[tuple[dict[str, Any], np.ndarray | None]]:
+    """Run SAM3D Body across selected views with optional concurrency."""
     if not sam3d_runner and not sam3d_command:
         return [(view, None) for view in views]
+
+    runner_pool = []
+    if isinstance(sam3d_runner, list):
+        runner_pool = sam3d_runner
+    elif sam3d_runner is not None:
+        runner_pool = [sam3d_runner]
+
     configured_workers = int(config.get("sam3d_view_workers", 0))
-    workers = len(views) if configured_workers <= 0 else configured_workers
-    workers = max(1, workers)
+    if runner_pool:
+        workers = len(runner_pool) if configured_workers <= 0 else min(configured_workers, len(runner_pool))
+    else:
+        workers = len(views) if configured_workers <= 0 else configured_workers
+    workers = max(1, min(workers, len(views)))
+
     if workers <= 1 or len(views) <= 1:
+        runner = runner_pool[0] if runner_pool else None
         return [
-            (view, run_sam3d_for_view(view, config, sam3d_command, sam3d_runner))
+            (view, run_sam3d_for_view(view, config, sam3d_command, runner))
             for view in views
         ]
 
-    workers = min(workers, len(views))
     print(f"    running SAM3D Body on {len(views)} views with {workers} workers")
     results_by_index: dict[int, tuple[dict[str, Any], np.ndarray | None]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(run_sam3d_for_view, view, config, sam3d_command, sam3d_runner): idx
-            for idx, view in enumerate(views)
-        }
-        for future in as_completed(futures):
-            idx = futures[future]
-            results_by_index[idx] = (views[idx], future.result())
+
+    if runner_pool:
+        groups = [[] for _ in range(workers)]
+        for idx, view in enumerate(views):
+            groups[idx % workers].append((idx, view))
+
+        def run_runner_group(runner, group):
+            group_results = []
+            for idx, view in group:
+                kpts = run_sam3d_for_view(view, config, sam3d_command, runner)
+                group_results.append((idx, view, kpts))
+            return group_results
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(run_runner_group, runner_pool[worker_idx], group)
+                for worker_idx, group in enumerate(groups)
+                if group
+            ]
+            for future in as_completed(futures):
+                for idx, view, kpts in future.result():
+                    results_by_index[idx] = (view, kpts)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(run_sam3d_for_view, view, config, sam3d_command, None): idx
+                for idx, view in enumerate(views)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                results_by_index[idx] = (views[idx], future.result())
+
     return [results_by_index[idx] for idx in range(len(views))]
 
 
@@ -1771,6 +2128,7 @@ def process_person(
     sam3d_command: str | None,
     sam3d_runner: Sam3DBodyDirectRunner | None = None,
 ) -> dict[str, Any]:
+    """Generate views, run SAM3D, fuse keypoints, and write outputs for one track."""
     track_id = int(box.get("track_id", box.get("id", -1)))
     source_bbox = box.get("bbox_xyxy") or box.get("box") or box.get("bbox")
     if not source_bbox or len(source_bbox) != 4:
@@ -1780,7 +2138,9 @@ def process_person(
     person_dir.mkdir(parents=True, exist_ok=True)
     print(f"  frame={frame_number} track={track_id} bbox={source_bbox}")
 
-    views = build_person_views(frame, source_bbox, frame_number, track_id, person_dir, config)
+    views = build_person_views(frame, source_bbox, frame_number, track_id, person_dir, config, box)
+    # Fuse only views that produced valid camera-space keypoints; failed views
+    # stay in the metadata but do not contribute to the world average.
     keypoints_world = []
     for view, kpts_cam in run_sam3d_for_views(views, config, sam3d_command, sam3d_runner):
         if kpts_cam is None:
@@ -1816,6 +2176,7 @@ def select_frame_records(
     track_id: int | None,
     max_frames: int | None,
 ) -> list[dict[str, Any]]:
+    """Select the subset of bbox frames to process from a tracking JSON payload."""
     selected = []
     for record in bbox_data["frames"]:
         if frame_number is not None and int(record["frame_number"]) != frame_number:
@@ -1832,6 +2193,7 @@ def select_frame_records(
 
 
 def parse_view_indices(value: str | None) -> list[int] | None:
+    """Parse a comma-separated view index list from the CLI."""
     if value is None or not value.strip():
         return None
     indices = []
@@ -1847,6 +2209,7 @@ def parse_view_indices(value: str | None) -> list[int] | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments for multiview fusion and visualization modes."""
     parser = argparse.ArgumentParser(description="360 bbox -> 8 perspective views -> SAM3D Body -> fused 3D kpts")
     parser.add_argument("--video", default=CONFIG["video_path"], help="360 equirectangular video path")
     parser.add_argument("--bbox-json", default=CONFIG["bbox_json_path"], help="bbox JSON from cotracker_person_tracking.py")
@@ -1860,7 +2223,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sam3d-checkpoint", default=CONFIG["sam3d_checkpoint_path"], help="local SAM3D Body model.ckpt path")
     parser.add_argument("--sam3d-mhr", default=CONFIG["sam3d_mhr_path"], help="local MHR model asset path")
     parser.add_argument("--sam3d-hf-repo", default=CONFIG["sam3d_hf_repo"], help="HF repo used when no local checkpoint is supplied")
-    parser.add_argument("--sam3d-device", default=CONFIG["sam3d_device"], help="auto, cpu, cuda, cuda:0, etc.")
+    parser.add_argument("--sam3d-devices", default=CONFIG["sam3d_devices"], help="auto or comma-separated devices, e.g. cuda:0,cuda:1")
+    parser.add_argument("--sam3d-estimators-per-device", type=int, default=CONFIG["sam3d_estimators_per_device"], help="number of SAM3D estimators to create on each selected device")
     parser.add_argument("--sam3d-inference-type", default=CONFIG["sam3d_inference_type"], choices=["full", "body", "hand"])
     parser.add_argument("--sam3d-view-workers", type=int, default=CONFIG["sam3d_view_workers"], help="number of perspective views to run concurrently; 0 means all selected views")
     parser.add_argument("--view-indices", default=None, help="comma-separated view indices to run, e.g. 0,2,4,6; default runs all views")
@@ -1881,6 +2245,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def resolve_sam3d_execution(args: argparse.Namespace) -> tuple[bool, str | None]:
+    """Choose between direct SAM3D API execution, command fallback, or no execution."""
+    # Default is the vendored official direct API. A command template is kept as
+    # an explicit compatibility fallback, while --no-run-sam3d is the dry-run
+    # mode for inspecting generated crops and projected bboxes.
     if args.no_run_sam3d:
         return False, None
     if args.sam3d_command:
@@ -1889,6 +2257,7 @@ def resolve_sam3d_execution(args: argparse.Namespace) -> tuple[bool, str | None]
 
 
 def main() -> int:
+    """Run the requested multiview processing or visualization mode."""
     args = parse_args()
     config = dict(CONFIG)
     config.update({
@@ -1903,7 +2272,8 @@ def main() -> int:
         "sam3d_checkpoint_path": args.sam3d_checkpoint,
         "sam3d_mhr_path": args.sam3d_mhr,
         "sam3d_hf_repo": args.sam3d_hf_repo,
-        "sam3d_device": args.sam3d_device,
+        "sam3d_devices": args.sam3d_devices,
+        "sam3d_estimators_per_device": max(1, int(args.sam3d_estimators_per_device)),
         "sam3d_inference_type": args.sam3d_inference_type,
         "sam3d_view_workers": max(0, int(args.sam3d_view_workers)),
         "view_indices": parse_view_indices(args.view_indices),
@@ -1916,7 +2286,8 @@ def main() -> int:
 
     bbox_json_path = Path(args.bbox_json)
     video_path = Path(args.video)
-    output_dir = Path(args.output_dir)
+    output_root = Path(args.output_dir)
+    output_dir = resolve_video_output_dir(output_root, video_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.visualize_existing:
@@ -1969,7 +2340,12 @@ def main() -> int:
     sam3d_runner = None
     direct_sam3d_requested, sam3d_command = resolve_sam3d_execution(args)
     if direct_sam3d_requested:
-        sam3d_runner = Sam3DBodyDirectRunner(config)
+        selected_views = config.get("view_indices")
+        max_view_workers = len(selected_views) if selected_views is not None else len(CONFIG["view_offsets_deg"])
+        configured_workers = int(config.get("sam3d_view_workers", 0))
+        if configured_workers > 0:
+            max_view_workers = min(max_view_workers, configured_workers)
+        sam3d_runner = create_sam3d_runner_pool(config, max_view_workers)
     elif sam3d_command is None:
         print("SAM3D Body disabled; saving perspective views and projected bboxes only.")
 

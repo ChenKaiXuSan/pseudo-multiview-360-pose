@@ -16,18 +16,79 @@ The method:
 
 ## Main Scripts
 
-- `cotracker_person_tracking.py`: YOLO detection, pose/grid query generation, CoTracker propagation, bbox reconstruction, and track ID association.
+- `cotracker_person_tracking_yolo.py`: YOLO detection, pose/grid query generation, CoTracker propagation, bbox reconstruction, and track ID association.
 - `sam3d_body_multiview_fusion.py`: equirectangular-to-perspective rendering, projected bbox generation, SAM3D Body execution, camera-to-world transform, and multiview 3D keypoint fusion.
 - `framewise_person_detection.py`: frame-by-frame baseline detection.
 - `test_360_detection.py`: 360 cubemap detection utilities and experiments.
 - `vlm_video_analyze.py`: VLM-based video frame analysis.
 
+## Project Layout
+
+The project is organized around two stages: tracking people in 360 videos, then
+creating pseudo-multiview views for SAM3D Body and fused 3D pose output. The
+original root-level scripts remain compatible entry points while the package
+layout grows around those stages.
+
+```text
+360PoseFusion/
+|-- configs/
+|   |-- tracking.yaml
+|   |-- multiview_fusion.yaml
+|   `-- paths.example.yaml
+|-- scripts/
+|   |-- run_tracking.py
+|   |-- run_multiview_fusion.py
+|   |-- run_direct_360_compare.py
+|   `-- run_full_pipeline.py
+|-- src/posefusion360/
+|   |-- io/               # video, tracking JSON, and output layout helpers
+|   |-- geometry/         # spherical, perspective, and camera/world math
+|   |-- tracking/         # stage 1: YOLO/CoTracker person tracking
+|   |-- multiview/        # stage 2: virtual views and world-space fusion
+|   |-- sam3d/            # SAM3D Body runner and result payload handling
+|   |-- visualization/    # frame/world/summary visualizations
+|   `-- pipelines/        # tracking, multiview, and full-pipeline entry points
+|-- tests/
+|-- third_party/
+|-- sam3d_body_multiview_fusion.py
+|-- sam3d_body_360_direct_compare.py
+`-- cotracker_person_tracking_yolo.py
+```
+
+The current package wrappers call the legacy scripts internally, so existing
+commands keep working while newer code can import from `posefusion360`.
+
 ## Example Commands
 
 ```bash
-python cotracker_person_tracking.py
+python cotracker_person_tracking_yolo.py
 python sam3d_body_multiview_fusion.py --max-frames 1
 python framewise_person_detection.py
+```
+
+Package-backed wrappers can be run from the repository root:
+
+```bash
+python scripts/run_yolo_tracking.py
+python scripts/run_multiview_fusion.py --max-frames 1
+python scripts/run_direct_360_compare.py --frame-number 41
+python scripts/run_full_pipeline.py
+```
+
+For editable package use:
+
+```bash
+python -m pip install -e .
+posefusion360-tracking
+posefusion360-multiview --max-frames 1
+posefusion360-direct360 --frame-number 41
+posefusion360-full-pipeline
+```
+
+Quick structure check:
+
+```bash
+python tests/test_project_structure.py
 ```
 
 Most scripts expect local video, model, checkpoint, or SAM3D Body paths to be configured in each script's `CONFIG` dictionary or passed by CLI flags where available.

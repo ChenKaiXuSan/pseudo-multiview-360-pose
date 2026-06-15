@@ -56,6 +56,7 @@ CONFIG = {
 
 
 def output_bbox_xyxy(output: dict[str, Any]) -> list[int] | None:
+    """Extract an integer xyxy bbox from one SAM3D direct output."""
     bbox = output.get("bbox") if isinstance(output, dict) else None
     if bbox is None:
         return None
@@ -66,6 +67,7 @@ def output_bbox_xyxy(output: dict[str, Any]) -> list[int] | None:
 
 
 def make_single_person_payload(image_path: Path, output: dict[str, Any], detection_index: int) -> dict[str, Any]:
+    """Wrap one SAM3D direct detection into the project JSON payload shape."""
     bbox_xyxy = output_bbox_xyxy(output)
     payload = {
         "image_path": normalize_command_path(image_path),
@@ -91,6 +93,7 @@ def make_single_person_payload(image_path: Path, output: dict[str, Any], detecti
 
 
 def rgb01_to_bgr255(color: np.ndarray | list[float]) -> tuple[int, int, int]:
+    """Convert RGB colors in 0-1 or 0-255 range to OpenCV BGR uint8 tuples."""
     arr = np.asarray(color, dtype=np.float64)
     if arr.max(initial=0.0) <= 1.0:
         arr = arr * 255.0
@@ -106,6 +109,7 @@ def draw_frame_direct_2d_overlay(
     min_conf: float,
     show_indices: bool,
 ) -> str | None:
+    """Draw SAM3D direct detections and 2D keypoints on the original 360 frame."""
     if frame_bgr is None or not track_results:
         return None
     image = frame_bgr.copy()
@@ -167,6 +171,7 @@ def save_frame_direct_3d_camera_plot(
     min_conf: float,
     title: str,
 ) -> str | None:
+    """Save a camera-space 3D plot for direct-360 SAM3D results."""
     tracks = []
     for result in track_results:
         rows = result.get("keypoints3d_camera")
@@ -230,6 +235,7 @@ def save_frame_direct_visualizations(
     track_results: list[dict[str, Any]],
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    """Save all visual diagnostics for one direct-360 frame."""
     style = load_mhr70_visual_style(config.get("sam3d_repo", ""))
     edges = style["edges"]
     min_conf = float(config.get("min_kpt_conf", 0.0))
@@ -269,6 +275,7 @@ def write_direct_track_result(
     output_dir: Path,
     config: dict[str, Any],
 ) -> dict[str, Any]:
+    """Write one direct-360 detection result JSON file."""
     track_id = int(detection_index)
     track_dir = output_dir / f"frame_{frame_number:06d}" / f"track_{track_id:04d}"
     track_dir.mkdir(parents=True, exist_ok=True)
@@ -340,6 +347,7 @@ def process_frame_direct_360(
     config: dict[str, Any],
     sam3d_runner: Sam3DBodyDirectRunner | None,
 ) -> list[dict[str, Any]]:
+    """Run direct SAM3D Body inference on one equirectangular frame."""
     frame_dir = output_dir / f"frame_{frame_number:06d}"
     frame_dir.mkdir(parents=True, exist_ok=True)
     image_path = frame_dir / "frame_360.jpg"
@@ -351,6 +359,8 @@ def process_frame_direct_360(
         print("  SAM3D Body disabled; saved frame only.")
         return []
 
+    # Passing None for the bbox intentionally exercises SAM3D Body's internal
+    # detector on the distorted 360 frame for baseline comparison only.
     sam3d_runner.run(image_path, None, sam_output_path)
     payload = load_sam3d_payload(sam_output_path) or {}
     outputs = payload.get("outputs", []) if isinstance(payload, dict) else []
@@ -383,6 +393,7 @@ def process_frame_direct_360(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments for the direct-360 baseline."""
     parser = argparse.ArgumentParser(description="Direct 360 frame -> SAM3D Body internal-detection comparison baseline")
     parser.add_argument("--video", default=CONFIG["video_path"], help="360 equirectangular video path")
     parser.add_argument("--output-dir", default=CONFIG["output_dir"], help="output directory")
@@ -410,6 +421,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def selected_frame_numbers(cap, frame_number: int | None, max_frames: int) -> list[int]:
+    """Choose which 1-based frame numbers to process."""
     if frame_number is not None:
         return [int(frame_number)]
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -419,6 +431,7 @@ def selected_frame_numbers(cap, frame_number: int | None, max_frames: int) -> li
 
 
 def main() -> int:
+    """Run direct-360 SAM3D baseline processing for selected frames."""
     args = parse_args()
     config = dict(CONFIG)
     config.update({

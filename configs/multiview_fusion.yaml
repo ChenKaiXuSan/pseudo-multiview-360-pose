@@ -1,0 +1,9 @@
+# Stage 2: generate pseudo-multiview views, run SAM3D Body, and fuse 3D keypoints.
+video_path: /mnt/dataset/skiing/360test/kimura2_360.mp4
+bbox_json_path: /mnt/dataset/skiing/360tracker_outputs/kimura2_360/kimura2_360_cotracker_selfie_yolo_bboxes.json
+output_dir: /mnt/dataset/skiing/sam3d_body_multiview
+view_size: 768
+hfov_deg: 90.0
+vfov_deg: 90.0
+sam3d_view_workers: 0
+view_indices: null

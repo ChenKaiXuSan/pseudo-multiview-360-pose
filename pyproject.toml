@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "posefusion360"
+version = "0.1.0"
+description = "Pseudo-multiview 3D human pose estimation from monocular 360 videos."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+posefusion360-multiview = "posefusion360.pipelines.multiview_fusion:main"
+posefusion360-direct360 = "posefusion360.pipelines.direct_360_compare:main"
+posefusion360-tracking = "posefusion360.pipelines.tracking:main"
+posefusion360-full-pipeline = "posefusion360.pipelines.full_pipeline:main"
+posefusion360-yolo-tracking = "posefusion360.pipelines.yolo_tracking:main"
