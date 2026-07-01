@@ -1,0 +1,3 @@
+[submodule "pose3d_kpt/third_party/sam-3d-body"]
+	path = pose3d_kpt/third_party/sam-3d-body
+	url = https://github.com/facebookresearch/sam-3d-body.git
