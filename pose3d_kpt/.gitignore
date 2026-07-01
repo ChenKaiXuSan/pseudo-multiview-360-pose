@@ -5,7 +5,7 @@ __pycache__/
 .vscode/
 .claude/
 
-# Large local assets, models, and generated media
+# Large local assets and generated media
 *.mp4
 *.mov
 *.avi
@@ -13,17 +13,10 @@ __pycache__/
 *.pt
 *.pth
 *.ckpt
-*.ply
-*.npz
 
 # Generated outputs
-outputs/
-**/outputs/
 *_output/
 *_outputs/
 *_frames/
 *_detected.*
-**/outputs/**/*.png
-**/outputs/**/*.jpg
-**/outputs/**/*.jpeg
 vlm_analysis_result.txt

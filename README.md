@@ -1,102 +1,101 @@
 # pseudo-multiview-360-pose
 
-Pseudo-multiview 3D human pose estimation from monocular 360 videos using CoTracker, virtual perspective views, and SAM3D Body fusion.
+This repository is organized into three pipeline modules for 360-video human pose and scene reconstruction work.
 
-## Overview
-
-This repository is for a research project on pseudo-multiview 3D human pose estimation from monocular 360-degree videos.
-
-The method:
-
-1. uses YOLO and CoTracker to stably track a person's bounding box in an equirectangular video,
-2. generates multiple virtual perspective views around the tracked human direction,
-3. runs SAM3D Body independently on each virtual view to obtain camera-space 3D keypoints,
-4. transforms the predicted keypoints into a shared world coordinate system using the known virtual camera yaw and pitch, and
-5. fuses the multiview results to produce a more stable 3D human pose estimate.
-
-## Main Scripts
-
-- `cotracker_person_tracking_yolo.py`: YOLO detection, pose/grid query generation, CoTracker propagation, bbox reconstruction, and track ID association.
-- `sam3d_body_multiview_fusion.py`: equirectangular-to-perspective rendering, projected bbox generation, SAM3D Body execution, camera-to-world transform, and multiview 3D keypoint fusion.
-- `framewise_person_detection.py`: frame-by-frame baseline detection.
-- `test_360_detection.py`: 360 cubemap detection utilities and experiments.
-- `vlm_video_analyze.py`: VLM-based video frame analysis.
-
-## Project Layout
-
-The project is organized around two stages: tracking people in 360 videos, then
-creating pseudo-multiview views for SAM3D Body and fused 3D pose output. The
-original root-level scripts remain compatible entry points while the package
-layout grows around those stages.
+## Repository Layout
 
 ```text
-360PoseFusion/
-|-- configs/
-|   |-- tracking.yaml
-|   |-- multiview_fusion.yaml
-|   `-- paths.example.yaml
-|-- scripts/
-|   |-- run_tracking.py
-|   |-- run_multiview_fusion.py
-|   |-- run_direct_360_compare.py
-|   `-- run_full_pipeline.py
-|-- src/posefusion360/
-|   |-- io/               # video, tracking JSON, and output layout helpers
-|   |-- geometry/         # spherical, perspective, and camera/world math
-|   |-- tracking/         # stage 1: YOLO/CoTracker person tracking
-|   |-- multiview/        # stage 2: virtual views and world-space fusion
-|   |-- sam3d/            # SAM3D Body runner and result payload handling
-|   |-- visualization/    # frame/world/summary visualizations
-|   `-- pipelines/        # tracking, multiview, and full-pipeline entry points
-|-- tests/
-|-- third_party/
-|-- sam3d_body_multiview_fusion.py
-|-- sam3d_body_360_direct_compare.py
-`-- cotracker_person_tracking_yolo.py
+pose3d_kpt/
+  Multi-perspective 360 human 3D keypoint estimation.
+
+pointcloud_reconstruction/
+  Multi-perspective VIPE scene reconstruction and point-cloud alignment.
+
+pose_pointcloud_fusion/
+  Person-centered filtering and visualization that combines 3D keypoints with point clouds.
 ```
 
-The current package wrappers call the legacy scripts internally, so existing
-commands keep working while newer code can import from `posefusion360`.
+## Developer Setup
 
-## Example Commands
+From the repository root, install the Python packages in editable mode when you want importable modules and `posefusion360-*` console scripts:
 
 ```bash
-python cotracker_person_tracking_yolo.py
-python sam3d_body_multiview_fusion.py --max-frames 1
-python framewise_person_detection.py
+cd /mnt/dataset/skiing/360PoseFusion
+python3 -m pip install -e . --no-deps
 ```
 
-Package-backed wrappers can be run from the repository root:
+The point-cloud and pose-pointcloud tools can also be run directly via their `scripts/` paths shown below.
+
+## 1. `pose3d_kpt`: Multi-View 3D KPT
+
+Goal: track a person in a 360 equirectangular video, render multiple perspective views around the person, run SAM3D Body per view, transform predictions into a shared world frame, and fuse 3D keypoints.
+
+Main entry points:
 
 ```bash
-python scripts/run_yolo_tracking.py
-python scripts/run_multiview_fusion.py --max-frames 1
-python scripts/run_direct_360_compare.py --frame-number 41
-python scripts/run_full_pipeline.py
+cd /mnt/dataset/skiing/360PoseFusion/pose3d_kpt
+python3 scripts/run_yolo_tracking.py
+python3 scripts/run_multiview_fusion.py --max-frames 1
+python3 scripts/run_full_pipeline.py
 ```
 
-For editable package use:
+Important outputs:
+
+```text
+sam3d_body_multiview/<sequence>/frame_XXXXXX/track_XXXX/fused/fused_keypoints3d.json
+sam3d_body_multiview/<sequence>/multiview_fused_keypoints3d.json
+```
+
+## 2. `pointcloud_reconstruction`: VIPE Point Cloud
+
+Goal: cut fixed perspective views from the 360 video, run VIPE on each view, export COLMAP text outputs, merge them into a shared world point cloud, and optionally refine view alignment.
+
+Main entry points:
 
 ```bash
-python -m pip install -e .
-posefusion360-tracking
-posefusion360-multiview --max-frames 1
-posefusion360-direct360 --frame-number 41
-posefusion360-full-pipeline
+cd /mnt/dataset/skiing/360PoseFusion
+python3 pointcloud_reconstruction/scripts/extract_dynamic_views.py --help
+python3 pointcloud_reconstruction/scripts/run_vipe_views.py --help
+python3 pointcloud_reconstruction/scripts/export_colmap_views.py --help
+python3 pointcloud_reconstruction/scripts/refine_vipe_views.py --help
 ```
 
-Quick structure check:
+Important outputs:
+
+```text
+pointcloud_reconstruction/outputs/<sequence>/views/
+pointcloud_reconstruction/outputs/<sequence>/vipe_results/
+pointcloud_reconstruction/outputs/<sequence>/colmap/
+pointcloud_reconstruction/outputs/<sequence>/refined_views_world*.ply
+pointcloud_reconstruction/outputs/<sequence>/refined_frame_plys*/frame_XXXXXX.ply
+```
+
+## 3. `pose_pointcloud_fusion`: 3D KPT + Point Cloud
+
+Goal: use 3D human keypoints as an anchor to filter or visualize scene point clouds around a person.
+
+Main entry points:
 
 ```bash
-python tests/test_project_structure.py
+cd /mnt/dataset/skiing/360PoseFusion
+python3 pose_pointcloud_fusion/scripts/filter_person_centered_cloud.py --help
+python3 pose_pointcloud_fusion/scripts/overlay_pose_pointcloud.py --help
 ```
 
-Most scripts expect local video, model, checkpoint, or SAM3D Body paths to be configured in each script's `CONFIG` dictionary or passed by CLI flags where available.
+Typical use cases:
 
-## Short Description
+- `scene` mode: keep scene points around the person trajectory and remove points close to the moving body skeleton.
+- `human` mode: keep only points close to the body skeleton.
+- overlay mode: append visible 3D pose joints and bones to a PLY for inspection.
 
-> A research project for pseudo-multiview 3D human pose estimation from monocular 360-degree videos, using CoTracker-stabilized person tracking, spherical-to-perspective virtual view generation, SAM3D Body inference, and camera-to-world keypoint fusion.
+## Testing
 
-## Suggested GitHub Description
+Run module tests separately:
 
-> Pseudo-multiview 3D human pose estimation from monocular 360 videos using CoTracker, virtual perspective views, and SAM3D Body fusion.
+```bash
+cd /mnt/dataset/skiing/360PoseFusion
+python3 -m unittest discover -s pointcloud_reconstruction/tests -v
+python3 -m unittest discover -s pose_pointcloud_fusion/tests -v
+```
+
+For `pose3d_kpt`, many tests depend on local SAM3D/CUDA/model assets. Use targeted tests when those dependencies are available.

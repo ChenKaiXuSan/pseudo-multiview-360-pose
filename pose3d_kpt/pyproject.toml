@@ -3,19 +3,17 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pseudo-multiview-360-pose"
+name = "posefusion360"
 version = "0.1.0"
-description = "360 video human pose, VIPE point-cloud reconstruction, and pose-pointcloud fusion tools."
+description = "Pseudo-multiview 3D human pose estimation from monocular 360 videos."
 readme = "README.md"
 requires-python = ">=3.10"
 
-[tool.setuptools.package-dir]
-posefusion360 = "pose3d_kpt/src/posefusion360"
-pointcloud_reconstruction = "pointcloud_reconstruction/src/pointcloud_reconstruction"
-pose_pointcloud_fusion = "pose_pointcloud_fusion/src/pose_pointcloud_fusion"
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
-where = ["pose3d_kpt/src", "pointcloud_reconstruction/src", "pose_pointcloud_fusion/src"]
+where = ["src"]
 
 [project.scripts]
 posefusion360-multiview = "posefusion360.pipelines.multiview_fusion:main"
