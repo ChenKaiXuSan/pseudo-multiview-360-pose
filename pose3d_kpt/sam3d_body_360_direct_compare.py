@@ -28,12 +28,14 @@ from sam3d_body_multiview_fusion import (
     keypoints3d_to_plot_coords,
     load_mhr70_visual_style,
     load_sam3d_payload,
+    read_bbox_json,
     normalize_command_path,
     numpy_to_jsonable,
     open_video,
     read_video_frame,
     save_keypoints2d_overlay,
     save_keypoints3d_plot,
+    select_frame_records,
     set_axes_equal,
     track_color_rgb01,
 )
@@ -41,7 +43,7 @@ from sam3d_body_multiview_fusion import (
 
 CONFIG = {
     **MULTIVIEW_CONFIG,
-    "output_dir": "/mnt/dataset/skiing/raw_new/sam3d_body_360_direct_compare",
+    "output_dir": "/mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/sam3d_direct360/kimura2_360",
     # Direct-360 comparison lets SAM3D Body detect people in the full frame.
     "sam3d_detector_name": "vitdet",
     "sam3d_detector_path": "",
@@ -66,14 +68,20 @@ def output_bbox_xyxy(output: dict[str, Any]) -> list[int] | None:
     return [int(round(float(v))) for v in arr[:4]]
 
 
-def make_single_person_payload(image_path: Path, output: dict[str, Any], detection_index: int) -> dict[str, Any]:
+def make_single_person_payload(
+    image_path: Path,
+    output: dict[str, Any],
+    detection_index: int,
+    detection_mode: str = "sam3d_internal_detector",
+    source_bbox_xyxy: list[int] | None = None,
+) -> dict[str, Any]:
     """Wrap one SAM3D direct detection into the project JSON payload shape."""
     bbox_xyxy = output_bbox_xyxy(output)
     payload = {
         "image_path": normalize_command_path(image_path),
         "bbox_format": "xyxy",
-        "bbox_xyxy": bbox_xyxy,
-        "detection_mode": "sam3d_internal_detector",
+        "bbox_xyxy": source_bbox_xyxy if source_bbox_xyxy is not None else bbox_xyxy,
+        "detection_mode": detection_mode,
         "detection_index": int(detection_index),
         "outputs": [numpy_to_jsonable(output)],
     }
@@ -274,16 +282,19 @@ def write_direct_track_result(
     frame_image_path: Path,
     output_dir: Path,
     config: dict[str, Any],
+    track_id: int | None = None,
+    source_bbox_xyxy: list[int] | None = None,
+    detection_mode: str = "sam3d_internal_detector",
 ) -> dict[str, Any]:
     """Write one direct-360 detection result JSON file."""
-    track_id = int(detection_index)
+    track_id = int(detection_index if track_id is None else track_id)
     track_dir = output_dir / f"frame_{frame_number:06d}" / f"track_{track_id:04d}"
     track_dir.mkdir(parents=True, exist_ok=True)
     image_path = track_dir / "frame_360.jpg"
     sam_output_path = track_dir / "sam3d_360.json"
     cv2.imwrite(str(image_path), frame_bgr)
 
-    person_payload = make_single_person_payload(image_path, output, detection_index)
+    person_payload = make_single_person_payload(image_path, output, detection_index, detection_mode, source_bbox_xyxy)
     sam_output_path.write_text(json.dumps(person_payload, indent=2), encoding="utf-8")
     bbox_xyxy = person_payload.get("bbox_xyxy")
     kpts2d = extract_keypoints2d(person_payload)
@@ -325,6 +336,7 @@ def write_direct_track_result(
         "source_bbox_xyxy": bbox_xyxy,
         "input_projection": "equirectangular_360_as_image",
         "coordinate_system": "direct SAM3D camera coordinates",
+        "detection_mode": detection_mode,
         "note": "SAM3D Body expects perspective images; this direct 360 result is a comparison baseline.",
         "image_path": normalize_command_path(image_path),
         "frame_image_path": normalize_command_path(frame_image_path),
@@ -338,6 +350,65 @@ def write_direct_track_result(
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     result["result_path"] = normalize_command_path(result_path)
     return result
+
+
+def source_bbox_from_box(box: dict[str, Any]) -> list[int]:
+    """Extract an integer xyxy bbox from a tracking record."""
+    bbox = box.get("bbox_xyxy") or box.get("box") or box.get("bbox")
+    if not bbox or len(bbox) != 4:
+        raise ValueError(f"box record missing bbox fields: {box}")
+    return [int(round(float(v))) for v in bbox]
+
+
+def process_frame_direct_360_with_bbox(
+    frame_bgr,
+    frame_number: int,
+    box: dict[str, Any],
+    output_dir: Path,
+    config: dict[str, Any],
+    sam3d_runner: Sam3DBodyDirectRunner | None,
+) -> list[dict[str, Any]]:
+    """Run direct SAM3D Body on one equirectangular frame with a provided tracking bbox."""
+    track_id = int(box.get("track_id", box.get("id", 1)))
+    source_bbox = source_bbox_from_box(box)
+    frame_dir = output_dir / f"frame_{frame_number:06d}"
+    track_dir = frame_dir / f"track_{track_id:04d}"
+    track_dir.mkdir(parents=True, exist_ok=True)
+    image_path = frame_dir / "frame_360.jpg"
+    sam_output_path = track_dir / "sam3d_360_provided_bbox.json"
+    cv2.imwrite(str(image_path), frame_bgr)
+
+    print(f"frame {frame_number:06d}: direct 360 SAM3D provided bbox track={track_id:04d} bbox={source_bbox}")
+    if sam3d_runner is None:
+        print("  SAM3D Body disabled; saved frame only.")
+        return []
+
+    sam3d_runner.run(image_path, source_bbox, sam_output_path)
+    payload = load_sam3d_payload(sam_output_path) or {}
+    outputs = payload.get("outputs", []) if isinstance(payload, dict) else []
+    if not outputs or not isinstance(outputs[0], dict):
+        print("  no SAM3D output for provided bbox")
+        return []
+
+    result = write_direct_track_result(
+        frame_bgr,
+        frame_number,
+        1,
+        outputs[0],
+        image_path,
+        output_dir,
+        config,
+        track_id=track_id,
+        source_bbox_xyxy=source_bbox,
+        detection_mode="provided_bbox",
+    )
+    if config.get("visualize_keypoints", True):
+        frame_vis = save_frame_direct_visualizations(frame_bgr, frame_number, frame_dir, [result], config)
+        if frame_vis.get("detections_kpts2d_path"):
+            print("  frame direct 2D: " + frame_vis["detections_kpts2d_path"])
+        if frame_vis.get("kpts3d_camera_path"):
+            print("  frame direct 3D: " + frame_vis["kpts3d_camera_path"])
+    return [result]
 
 
 def process_frame_direct_360(
@@ -395,26 +466,28 @@ def process_frame_direct_360(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the direct-360 baseline."""
     parser = argparse.ArgumentParser(description="Direct 360 frame -> SAM3D Body internal-detection comparison baseline")
-    parser.add_argument("--video", default=CONFIG["video_path"], help="360 equirectangular video path")
-    parser.add_argument("--output-dir", default=CONFIG["output_dir"], help="output directory")
+    parser.add_argument("--video", default=CONFIG.get("video_path", MULTIVIEW_CONFIG.get("video_path", "")), help="360 equirectangular video path")
+    parser.add_argument("--bbox-json", default=None, help="optional tracking bbox JSON; when set, run only provided bboxes instead of SAM3D internal detection")
+    parser.add_argument("--track-id", type=int, default=None, help="track id to select from --bbox-json, e.g. 1 for selfie-only baseline")
+    parser.add_argument("--output-dir", default=CONFIG.get("output_dir", ""), help="output directory")
     parser.add_argument("--frame-number", type=int, default=None, help="only process this 1-based frame number")
     parser.add_argument("--max-frames", type=int, default=1, help="maximum video frames to process from frame 1; set 0 for all")
     parser.add_argument("--no-run-sam3d", action="store_true", help="save frames only; do not run SAM3D Body")
-    parser.add_argument("--sam3d-repo", default=CONFIG["sam3d_repo"], help="path to facebookresearch/sam-3d-body repo")
-    parser.add_argument("--sam3d-checkpoint", default=CONFIG["sam3d_checkpoint_path"], help="local SAM3D Body model.ckpt path")
-    parser.add_argument("--sam3d-mhr", default=CONFIG["sam3d_mhr_path"], help="local MHR model asset path")
-    parser.add_argument("--sam3d-hf-repo", default=CONFIG["sam3d_hf_repo"], help="HF repo used when no local checkpoint is supplied")
-    parser.add_argument("--sam3d-device", default=CONFIG["sam3d_device"], help="auto, cpu, cuda, cuda:0, etc.")
-    parser.add_argument("--sam3d-inference-type", default=CONFIG["sam3d_inference_type"], choices=["full", "body", "hand"])
-    parser.add_argument("--sam3d-detector", default=CONFIG["sam3d_detector_name"], help="SAM3D Body detector name, e.g. vitdet or sam3; empty disables detector")
-    parser.add_argument("--sam3d-detector-path", default=CONFIG["sam3d_detector_path"], help="optional local detector checkpoint directory")
-    parser.add_argument("--sam3d-detector-bbox-thr", type=float, default=CONFIG["sam3d_detector_bbox_thr"], help="detector confidence threshold")
-    parser.add_argument("--sam3d-detector-nms-thr", type=float, default=CONFIG["sam3d_detector_nms_thr"], help="detector NMS threshold")
+    parser.add_argument("--sam3d-repo", default=CONFIG.get("sam3d_repo", ""), help="path to facebookresearch/sam-3d-body repo")
+    parser.add_argument("--sam3d-checkpoint", default=CONFIG.get("sam3d_checkpoint_path", ""), help="local SAM3D Body model.ckpt path")
+    parser.add_argument("--sam3d-mhr", default=CONFIG.get("sam3d_mhr_path", ""), help="local MHR model asset path")
+    parser.add_argument("--sam3d-hf-repo", default=CONFIG.get("sam3d_hf_repo", "facebook/sam-3d-body-dinov3"), help="HF repo used when no local checkpoint is supplied")
+    parser.add_argument("--sam3d-device", default=CONFIG.get("sam3d_device", "auto"), help="auto, cpu, cuda, cuda:0, etc.")
+    parser.add_argument("--sam3d-inference-type", default=CONFIG.get("sam3d_inference_type", "body"), choices=["full", "body", "hand"])
+    parser.add_argument("--sam3d-detector", default=CONFIG.get("sam3d_detector_name", "vitdet"), help="SAM3D Body detector name, e.g. vitdet or sam3; empty disables detector")
+    parser.add_argument("--sam3d-detector-path", default=CONFIG.get("sam3d_detector_path", ""), help="optional local detector checkpoint directory")
+    parser.add_argument("--sam3d-detector-bbox-thr", type=float, default=CONFIG.get("sam3d_detector_bbox_thr", 0.5), help="detector confidence threshold")
+    parser.add_argument("--sam3d-detector-nms-thr", type=float, default=CONFIG.get("sam3d_detector_nms_thr", 0.3), help="detector NMS threshold")
     parser.add_argument("--known-intrinsics", action="store_true", help="pass fake pinhole intrinsics for the whole 360 frame")
     parser.add_argument("--hfov", type=float, default=120.0, help="fake horizontal FOV when --known-intrinsics is used")
     parser.add_argument("--vfov", type=float, default=90.0, help="fake vertical FOV when --known-intrinsics is used")
     parser.add_argument("--no-sam-cam-translation", action="store_true", help="use root-relative pred_keypoints_3d instead of pred_keypoints_3d + pred_cam_t")
-    parser.add_argument("--min-kpt-conf", type=float, default=CONFIG["min_kpt_conf"])
+    parser.add_argument("--min-kpt-conf", type=float, default=CONFIG.get("min_kpt_conf", 0.0))
     parser.add_argument("--no-kpt-vis", action="store_true", help="skip 2D/3D keypoint visualization PNG outputs")
     parser.add_argument("--no-joint-indices", action="store_true", help="hide joint index labels in plots")
     return parser.parse_args(argv)
@@ -461,19 +534,42 @@ def main() -> int:
     if not args.no_run_sam3d:
         sam3d_runner = Sam3DBodyDirectRunner(config)
 
+    bbox_records = None
+    if args.bbox_json:
+        bbox_data = read_bbox_json(Path(args.bbox_json))
+        bbox_records = select_frame_records(
+            bbox_data,
+            args.frame_number,
+            args.track_id,
+            None if int(args.max_frames) == 0 else int(args.max_frames),
+        )
+        if not bbox_records:
+            print("No bbox records matched the requested frame/track filters.")
+            return 1
+
     cap = open_video(Path(args.video))
     results = []
     try:
-        frame_numbers = selected_frame_numbers(cap, args.frame_number, args.max_frames)
-        if not frame_numbers:
-            print("No video frames matched the requested frame filters.")
-            return 1
-        for frame_number in frame_numbers:
-            frame_bgr = read_video_frame(cap, frame_number)
-            h, w = frame_bgr.shape[:2]
-            config["view_width"] = int(w)
-            config["view_height"] = int(h)
-            results.extend(process_frame_direct_360(frame_bgr, frame_number, output_dir, config, sam3d_runner))
+        if bbox_records is not None:
+            for record in bbox_records:
+                frame_number = int(record["frame_number"])
+                frame_bgr = read_video_frame(cap, frame_number)
+                h, w = frame_bgr.shape[:2]
+                config["view_width"] = int(w)
+                config["view_height"] = int(h)
+                for box in record.get("boxes", []):
+                    results.extend(process_frame_direct_360_with_bbox(frame_bgr, frame_number, box, output_dir, config, sam3d_runner))
+        else:
+            frame_numbers = selected_frame_numbers(cap, args.frame_number, args.max_frames)
+            if not frame_numbers:
+                print("No video frames matched the requested frame filters.")
+                return 1
+            for frame_number in frame_numbers:
+                frame_bgr = read_video_frame(cap, frame_number)
+                h, w = frame_bgr.shape[:2]
+                config["view_width"] = int(w)
+                config["view_height"] = int(h)
+                results.extend(process_frame_direct_360(frame_bgr, frame_number, output_dir, config, sam3d_runner))
     finally:
         cap.release()
 
@@ -481,9 +577,12 @@ def main() -> int:
         "video_path": str(Path(args.video).resolve()),
         "output_dir": str(output_dir.resolve()),
         "num_results": len(results),
+        "mode": "provided_bbox_single_person" if args.bbox_json else "sam3d_internal_detector",
+        "bbox_json_path": str(Path(args.bbox_json).resolve()) if args.bbox_json else None,
+        "selected_track_id": args.track_id,
         "sam3d_direct_api": sam3d_runner is not None,
-        "sam3d_internal_detector": bool(config.get("sam3d_detector_name")),
-        "sam3d_detector_name": config.get("sam3d_detector_name"),
+        "sam3d_internal_detector": False if args.bbox_json else bool(config.get("sam3d_detector_name")),
+        "sam3d_detector_name": None if args.bbox_json else config.get("sam3d_detector_name"),
         "known_intrinsics": bool(args.known_intrinsics),
         "results": results,
     }

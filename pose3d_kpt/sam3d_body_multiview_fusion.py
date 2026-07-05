@@ -42,8 +42,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 CONFIG = {
     "video_path": "/mnt/dataset/skiing/360test/kimura2_360.mp4",
-    "bbox_json_path": "/mnt/dataset/skiing/360tracker_outputs/kimura2_360/kimura2_360_cotracker_selfie_yolo_bboxes.json",
-    "output_dir": "/mnt/dataset/skiing/sam3d_body_multiview",
+    "bbox_json_path": "/mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/tracking/kimura2_360/kimura2_360_cotracker_selfie_yolo_bboxes.json",
+    "output_dir": "/mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/sam3d_multiview",
     "view_width": 768,
     "view_height": 768,
     "hfov_deg": 90.0,

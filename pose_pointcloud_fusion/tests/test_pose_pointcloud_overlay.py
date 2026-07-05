@@ -42,6 +42,30 @@ class PosePointcloudOverlayTests(unittest.TestCase):
         self.assertFalse(kpts[1].mask_valid)
         self.assertFalse(kpts[2].mask_valid)
 
+    def test_load_fused_keypoints_accepts_image_anchor_alignment_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aligned_keypoints3d.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "frame_number": 2,
+                        "track_id": 1,
+                        "aligned_keypoints3d_world": [
+                            [1.0, 2.0, 3.0, 0.9],
+                            [4.0, 5.0, 6.0, 0.2],
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            kpts = load_fused_keypoints(path, min_conf=0.5)
+
+        self.assertEqual(kpts.shape, (2, 4))
+        self.assertTrue(kpts[0].mask_valid)
+        self.assertFalse(kpts[1].mask_valid)
+        self.assertEqual(kpts.frame_number, 2)
+
     def test_build_pose_overlay_points_adds_joint_markers_and_bone_samples(self):
         keypoints = load_fused_keypoints.from_rows(
             [

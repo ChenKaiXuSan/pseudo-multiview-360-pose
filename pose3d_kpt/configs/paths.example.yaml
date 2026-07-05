@@ -1,6 +1,6 @@
 # Example machine-local paths. Copy to paths.yaml and edit for your machine.
 video_path: /mnt/dataset/skiing/360test/kimura2_360.mp4
-output_dir: /mnt/dataset/skiing/sam3d_body_multiview
+output_dir: /mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/sam3d_multiview
 yolo_model_path: /mnt/dataset/skiing/360PoseFusion/yolo26x-sem.pt
 sam3d_repo: /mnt/dataset/skiing/360PoseFusion/third_party/sam-3d-body
 sam3d_checkpoint_path: /mnt/dataset/skiing/checkpoints/sam-3d-body-dinov3/model.ckpt

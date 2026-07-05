@@ -84,8 +84,11 @@ def _rows_to_fused_keypoints(
 def load_fused_keypoints(path: Path, min_conf: float = 0.3) -> FusedKeypoints:
     """Load one SAM3D multiview fused-keypoint JSON in world coordinates."""
     payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("fused_keypoints3d_world")
+    if rows is None:
+        rows = payload.get("aligned_keypoints3d_world", [])
     return _rows_to_fused_keypoints(
-        payload.get("fused_keypoints3d_world", []),
+        rows,
         min_conf=min_conf,
         frame_number=payload.get("frame_number"),
         track_id=payload.get("track_id"),

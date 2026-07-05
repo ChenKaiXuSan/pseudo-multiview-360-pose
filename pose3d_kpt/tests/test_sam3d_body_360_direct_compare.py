@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 sys.modules.setdefault("cv2", types.SimpleNamespace(imwrite=lambda path, image: True, rectangle=lambda *args, **kwargs: None, circle=lambda *args, **kwargs: None, line=lambda *args, **kwargs: None, putText=lambda *args, **kwargs: None, FONT_HERSHEY_SIMPLEX=0, LINE_AA=0))
 
 
@@ -76,7 +78,12 @@ fake_pyplot.close = lambda *args, **kwargs: None
 sys.modules.setdefault("matplotlib", fake_matplotlib)
 sys.modules.setdefault("matplotlib.pyplot", fake_pyplot)
 
-from sam3d_body_360_direct_compare import parse_args, save_frame_direct_visualizations, write_direct_track_result
+from sam3d_body_360_direct_compare import (
+    parse_args,
+    process_frame_direct_360_with_bbox,
+    save_frame_direct_visualizations,
+    write_direct_track_result,
+)
 from sam3d_body_multiview_fusion import Sam3DBodyDirectRunner
 
 
@@ -107,6 +114,13 @@ def test_direct_compare_cli_defaults_to_official_sam3d_without_run_flag() -> Non
 
     assert not hasattr(args, "run_sam3d")
     assert args.no_run_sam3d is False
+
+
+def test_direct_compare_cli_accepts_bbox_driven_single_person_mode() -> None:
+    args = parse_args(["--bbox-json", "selfie_bboxes.json", "--track-id", "1"])
+
+    assert args.bbox_json == "selfie_bboxes.json"
+    assert args.track_id == 1
 
 
 def test_direct_track_result_does_not_write_fusion_outputs() -> None:
@@ -186,8 +200,37 @@ def test_sam3d_runner_can_use_internal_detector_without_bbox() -> None:
     assert kpts.shape == (2, 4)
 
 
+def test_process_frame_direct_360_with_bbox_uses_provided_tracking_box() -> None:
+    runner = Sam3DBodyDirectRunner.__new__(Sam3DBodyDirectRunner)
+    runner.estimator = FakeEstimator()
+    runner.config = {
+        "sam3d_use_known_intrinsics": False,
+        "sam3d_inference_type": "body",
+        "sam3d_use_camera_translation": True,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        results = process_frame_direct_360_with_bbox(
+            frame_bgr=np.zeros((24, 32, 3), dtype=np.uint8),
+            frame_number=56,
+            box={"track_id": 7, "bbox_xyxy": [4, 5, 14, 25]},
+            output_dir=Path(tmp),
+            config={"visualize_keypoints": False, "sam3d_use_camera_translation": True},
+            sam3d_runner=runner,
+        )
+
+    _, kwargs = runner.estimator.calls[0]
+    assert kwargs["bboxes"].tolist() == [[4.0, 5.0, 14.0, 25.0]]
+    assert len(results) == 1
+    assert results[0]["track_id"] == 7
+    assert results[0]["source_bbox_xyxy"] == [4, 5, 14, 25]
+    assert results[0]["detection_mode"] == "provided_bbox"
+
+
 if __name__ == "__main__":
     test_direct_compare_cli_defaults_to_official_sam3d_without_run_flag()
+    test_direct_compare_cli_accepts_bbox_driven_single_person_mode()
     test_direct_track_result_does_not_write_fusion_outputs()
     test_frame_direct_visualizations_return_combined_paths()
     test_sam3d_runner_can_use_internal_detector_without_bbox()
+    test_process_frame_direct_360_with_bbox_uses_provided_tracking_box()

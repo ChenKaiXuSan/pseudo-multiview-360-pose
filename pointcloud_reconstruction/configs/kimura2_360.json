@@ -1,7 +1,7 @@
 {
   "video": "/mnt/dataset/skiing/360test/kimura2_360.mp4",
-  "bbox_json": "/mnt/dataset/skiing/360tracker_outputs/kimura2_360/kimura2_360_cotracker_selfie_yolo_bboxes.json",
-  "output_dir": "/mnt/dataset/skiing/360PoseFusion/pointcloud_reconstruction/outputs/kimura2_360",
+  "bbox_json": "/mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/tracking/kimura2_360/kimura2_360_cotracker_selfie_yolo_bboxes.json",
+  "output_dir": "/mnt/dataset/skiing/360PoseFusion/output/pointcloud_reconstruction/multiview_4view/kimura2_360",
   "target_id": 1,
   "view_size": 1024,
   "fov_deg": 100.0,

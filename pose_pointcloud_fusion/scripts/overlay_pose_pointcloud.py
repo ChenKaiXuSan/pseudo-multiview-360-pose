@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scene-ply",
         type=Path,
-        default=Path("/mnt/dataset/skiing/360PoseFusion/pointcloud_reconstruction/outputs/kimura2_360/merged_views_world.ply"),
+        default=Path("/mnt/dataset/skiing/360PoseFusion/output/pointcloud_reconstruction/multiview_4view/kimura2_360/merged_views_world.ply"),
         help="Background ASCII xyzrgb PLY. Used for every pose frame unless --scene-frame-dir has a matching frame PLY.",
     )
     parser.add_argument(
@@ -36,13 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pose-root",
         type=Path,
-        default=Path("/mnt/dataset/skiing/sam3d_body_multiview/kimura2_360"),
+        default=Path("/mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/sam3d_multiview/kimura2_360"),
         help="SAM3D multiview video output root containing frame_XXXXXX/track_XXXX/fused/fused_keypoints3d.json.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/mnt/dataset/skiing/360PoseFusion/pose_pointcloud_fusion/outputs/pose_pointcloud_overlay"),
+        default=Path("/mnt/dataset/skiing/360PoseFusion/output/pose_pointcloud_fusion/overlay/pose_pointcloud_overlay"),
         help="Directory for overlay PLYs, screenshots, and summary JSON.",
     )
     parser.add_argument("--start-frame", type=int, default=1, help="First SAM3D frame number to export.")

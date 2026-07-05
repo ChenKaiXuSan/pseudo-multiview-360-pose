@@ -27,3 +27,4 @@ outputs/
 **/outputs/**/*.jpg
 **/outputs/**/*.jpeg
 vlm_analysis_result.txt
+output/

@@ -55,7 +55,7 @@ def apply_video_name_output_paths(config):
 CONFIG = {
     # Paths
     "video_path": "/mnt/dataset/skiing/360test/kimura2_360.mp4",
-    "output_root_dir": "/mnt/dataset/skiing/360tracker_outputs",
+    "output_root_dir": "/mnt/dataset/skiing/360PoseFusion/output/pose3d_kpt/tracking",
     "output_suffix": "cotracker_yolo",
 
     # Models
