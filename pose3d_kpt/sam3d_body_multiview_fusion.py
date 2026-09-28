@@ -19,6 +19,7 @@ with values shaped as [[x, y, z], ...] or [[x, y, z, conf], ...].
 from __future__ import annotations
 
 import argparse
+import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
 import json
@@ -691,6 +692,20 @@ def save_fused_keypoints_npz(result: dict[str, Any], output_path: Path) -> Path 
     return output_path
 
 
+def sam3d_device_context(torch_module: Any, device: str | Any):
+    """Return a context that makes ``device`` the current CUDA device for this thread.
+
+    Non-CUDA devices (for example ``cpu``) return a no-op context.
+    """
+    device_obj = torch_module.device(device)
+    if device_obj.type != "cuda":
+        return contextlib.nullcontext()
+    index = device_obj.index
+    if index is None:
+        index = torch_module.cuda.current_device()
+    return torch_module.cuda.device(index)
+
+
 def make_camera_intrinsics(width: int, height: int, hfov_deg: float, vfov_deg: float):
     """Create a pinhole camera intrinsic matrix from image size and field of view."""
     import torch
@@ -729,12 +744,15 @@ class Sam3DBodyDirectRunner:
         mhr_path = str(config.get("sam3d_mhr_path") or "").strip()
         hf_repo = str(config.get("sam3d_hf_repo") or "facebook/sam-3d-body-dinov3")
 
-        if checkpoint_path:
-            print(f"Loading SAM3D Body checkpoint: {checkpoint_path}")
-            model, model_cfg = load_sam_3d_body(checkpoint_path, device=device, mhr_path=mhr_path)
-        else:
-            print(f"Loading SAM3D Body from Hugging Face: {hf_repo}")
-            model, model_cfg = load_sam_3d_body_hf(hf_repo, device=device)
+        # Load inside the target device context as well: some upstream heads
+        # allocate assets on the *current* CUDA device during construction.
+        with sam3d_device_context(torch, device):
+            if checkpoint_path:
+                print(f"Loading SAM3D Body checkpoint: {checkpoint_path}")
+                model, model_cfg = load_sam_3d_body(checkpoint_path, device=device, mhr_path=mhr_path)
+            else:
+                print(f"Loading SAM3D Body from Hugging Face: {hf_repo}")
+                model, model_cfg = load_sam_3d_body_hf(hf_repo, device=device)
 
         human_detector = None
         detector_name = str(config.get("sam3d_detector_name") or "").strip()
@@ -756,6 +774,7 @@ class Sam3DBodyDirectRunner:
             fov_estimator=None,
         )
         self.config = config
+        self.device = device
 
     def run(self, image_path: Path, bbox_xyxy: list[int] | None, output_json_path: Path) -> np.ndarray | None:
         """Run SAM3D Body on one view image with an optional bbox prompt."""
@@ -772,7 +791,12 @@ class Sam3DBodyDirectRunner:
             )
 
         inference_type = str(self.config.get("sam3d_inference_type", "full"))
-        with torch.no_grad():
+        # The upstream SAM3D Body code moves inputs with bare ".cuda()" and
+        # recursive_to(batch, "cuda"), which always resolve to the *current*
+        # CUDA device of this thread. Pin the current device to the one this
+        # runner's model was loaded on so multi-GPU runner pools (cuda:1, ...)
+        # do not hit cross-device tensor errors, without patching upstream.
+        with sam3d_device_context(torch, self.device), torch.no_grad():
             try:
                 outputs = self.estimator.process_one_image(
                     str(image_path),
