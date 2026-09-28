@@ -21,6 +21,7 @@ The method:
 - `framewise_person_detection.py`: frame-by-frame baseline detection.
 - `cubemap_detection.py`: 360 cubemap/sliding-window YOLO detection utilities used by the tracking scripts.
 - `vlm_person_detection.py`: VLM-based (Qwen-VL) person detection experiment.
+- `video_person_detection.py`: plain YOLOv8 per-frame person detection on a regular video (early baseline experiment).
 
 ## Project Layout
 
@@ -55,6 +56,7 @@ pose3d_kpt/
 |-- framewise_person_detection.py
 |-- sam3d_body_multiview_fusion.py
 |-- sam3d_body_360_direct_compare.py
+|-- video_person_detection.py
 `-- vlm_person_detection.py
 ```
 

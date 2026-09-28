@@ -325,7 +325,8 @@ def test_select_selfie_frame_box_returns_only_matched_detector_box() -> None:
     assert box == {
         "id": 1,
         "box": (98, 100, 205, 330),
-        "source": "pose",
+        "source": "yolo_matched",
+        "ref_source": "pose",
         "visible_points": 11,
         "score": 0.91,
     }
@@ -355,9 +356,10 @@ def test_apply_video_name_output_paths_uses_input_stem_for_person_tracker() -> N
 
     updated = apply_video_name_output_paths(config)
 
-    assert updated["output_path"] == "/tmp/out/custom_run_cotracker_yolo_tracked.mp4"
-    assert updated["frames_output_dir"] == "/tmp/out/custom_run_cotracker_yolo_frames"
-    assert updated["bbox_output_path"] == "/tmp/out/custom_run_cotracker_yolo_bboxes.json"
+    # Outputs are grouped under a per-video directory named after the input stem.
+    assert updated["output_path"] == "/tmp/out/custom_run/custom_run_cotracker_yolo_tracked.mp4"
+    assert updated["frames_output_dir"] == "/tmp/out/custom_run/custom_run_cotracker_yolo_frames"
+    assert updated["bbox_output_path"] == "/tmp/out/custom_run/custom_run_cotracker_yolo_bboxes.json"
     assert config.get("output_path") is None
 
 
@@ -381,7 +383,7 @@ def test_apply_video_name_output_paths_preserves_explicit_paths() -> None:
 def test_resolve_model_path_prefers_script_dir() -> None:
     path = resolve_model_path("yolo26xseg.pt")
 
-    assert str(path).endswith("360PoseFusion/yolo26xseg.pt")
+    assert str(path).endswith("pose3d_kpt/yolo26xseg.pt")
 
 
 def test_build_detection_views_uses_18_view_layout() -> None:
@@ -412,7 +414,7 @@ def test_apply_video_name_output_paths_adds_debug_view_dir() -> None:
 
     updated = apply_video_name_output_paths(config)
 
-    assert updated["view_debug_dir"] == "/tmp/out/custom_run_cotracker_yolo_views"
+    assert updated["view_debug_dir"] == "/tmp/out/custom_run/custom_run_cotracker_yolo_cubemap_views"
 
 
 def test_filter_overlapping_track_boxes_drops_upper_body_overlay_fragment() -> None:

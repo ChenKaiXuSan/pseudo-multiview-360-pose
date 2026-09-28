@@ -60,7 +60,8 @@ def make_track(frame_dir: Path, track_id: int, offset: float) -> None:
 
 def test_load_mhr70_visual_style_from_repo_path_without_package_deps() -> None:
     repo = Path(__file__).resolve().parents[1] / "third_party" / "sam-3d-body"
-    if not repo.exists():
+    if not (repo / "sam_3d_body").is_dir():
+        # Submodule not checked out (e.g. a fresh worktree): nothing to load.
         return
 
     style = load_mhr70_visual_style(str(repo))
@@ -74,7 +75,7 @@ def test_cli_defaults_to_official_sam3d_without_run_flag() -> None:
 
     assert not hasattr(args, "run_sam3d")
     assert args.no_run_sam3d is False
-    assert "360PoseFusion/third_party/sam-3d-body" in str(CONFIG["sam3d_repo"])
+    assert "pose3d_kpt/third_party/sam-3d-body" in str(CONFIG["sam3d_repo"])
 
 
 def test_no_run_sam3d_disables_direct_and_command_runners() -> None:
@@ -447,16 +448,23 @@ def test_frame_track_axes_use_skeleton_style_colors() -> None:
         min_conf=0.0,
     )
 
+    # 3D scatter collections only expose their full, depth-sorted facecolors
+    # after a draw (matplotlib >= 3.10 truncates/reorders them before that).
+    fig.canvas.draw()
     overlay_line_colors = [to_rgb(line.get_color()) for line in overlay_ax.lines[:2]]
     world_line_colors = [to_rgb(line.get_color()) for line in world_ax.lines[:2]]
     overlay_point_colors = overlay_ax.collections[0].get_facecolors()[:, :3]
     world_point_colors = world_ax.collections[0].get_facecolors()[:, :3]
     plt.close(fig)
 
+    def _sorted_rows(colors: np.ndarray) -> np.ndarray:
+        arr = np.asarray(colors, dtype=np.float64)
+        return arr[np.lexsort(arr.T[::-1])]
+
     assert np.allclose(overlay_line_colors, edge_colors)
     assert np.allclose(world_line_colors, edge_colors)
     assert np.allclose(overlay_point_colors, point_colors)
-    assert np.allclose(world_point_colors, point_colors)
+    assert np.allclose(_sorted_rows(world_point_colors), _sorted_rows(point_colors))
 
 
 def test_track_fused_summary_visualization_writes_image_and_metadata() -> None:
