@@ -86,7 +86,7 @@ from cotracker_selfie_bbox_tracking_yolo import (  # noqa: E402
     select_selfie_detection,
     select_selfie_frame_box,
 )
-from test_360_detection import build_detection_views, cluster_view_detections  # noqa: E402
+from cubemap_detection import build_detection_views, cluster_view_detections  # noqa: E402
 
 
 def test_grid_points_in_box_keeps_points_inside_margin() -> None:

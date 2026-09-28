@@ -21,7 +21,7 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("ultralytics", types.SimpleNamespace(YOLO=lambda *args, **kwargs: None))
 sys.modules.setdefault(
-    "test_360_detection",
+    "cubemap_detection",
     types.SimpleNamespace(cubemap_sliding_detection=lambda *args, **kwargs: ([], None)),
 )
 

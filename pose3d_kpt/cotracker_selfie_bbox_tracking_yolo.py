@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from test_360_detection import cubemap_sliding_detection
+from cubemap_detection import cubemap_sliding_detection
 from cotracker_person_tracking_yolo import (
     COLORS,
     CONFIG as BASE_CONFIG,

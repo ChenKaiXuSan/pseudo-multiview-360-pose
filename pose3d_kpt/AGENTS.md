@@ -5,11 +5,11 @@
 This repository is a flat Python workflow for 360-degree skiing video analysis.
 Core scripts live at the repository root:
 
-- `test_person_detection.py` and `test_360_detection.py`: YOLO-based detection experiments.
-- `cotracker_person_tracking.py`: clip-based person tracking and bbox JSON export.
+- `cubemap_detection.py`: cubemap/sliding-window YOLO detection utilities shared by the tracking scripts.
+- `cotracker_person_tracking_yolo.py` and `cotracker_selfie_bbox_tracking_yolo.py`: clip-based person tracking and bbox JSON export.
 - `framewise_person_detection.py`: frame-by-frame baseline detection and pose extraction.
 - `sam3d_body_multiview_fusion.py`: perspective-view generation, SAM3D Body execution, and fused 3D keypoint visualization.
-- `vlm_video_analyze.py` and `test_360_vlm_person_detection.py`: VLM-based frame/video analysis.
+- `vlm_person_detection.py`: VLM-based person detection experiment.
 
 Local assets include `kimura2_360_half.mp4`, `kimura2_360_half_detected.mp4`, `yolov8n.pt`, and `vlm_analysis_result.txt`. Generated caches such as `__pycache__/` should not be committed.
 
@@ -18,12 +18,11 @@ Local assets include `kimura2_360_half.mp4`, `kimura2_360_half_detected.mp4`, `y
 There is no package build step. Run scripts directly from the repository root.
 
 ```bash
-python test_person_detection.py
-python test_360_detection.py
-python cotracker_person_tracking.py
+python cubemap_detection.py
+python cotracker_person_tracking_yolo.py
 python framewise_person_detection.py
 python sam3d_body_multiview_fusion.py --max-frames 1
-conda run -n vlminference python vlm_video_analyze.py --frames 8
+conda run -n vlminference python vlm_person_detection.py
 ```
 
 Use `python -m py_compile *.py` for a quick syntax check. Most workflows require GPU-capable dependencies such as `torch`, `opencv-python`, `ultralytics`, `numpy`, `matplotlib`, `Pillow`, `decord`, and `transformers`.

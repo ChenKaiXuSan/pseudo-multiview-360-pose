@@ -695,8 +695,10 @@ def save_fused_keypoints_npz(result: dict[str, Any], output_path: Path) -> Path 
 def sam3d_device_context(torch_module: Any, device: str | Any):
     """Return a context that makes ``device`` the current CUDA device for this thread.
 
-    Non-CUDA devices (for example ``cpu``) return a no-op context.
+    ``None`` and non-CUDA devices (for example ``cpu``) return a no-op context.
     """
+    if device is None:
+        return contextlib.nullcontext()
     device_obj = torch_module.device(device)
     if device_obj.type != "cuda":
         return contextlib.nullcontext()
@@ -722,6 +724,8 @@ def make_camera_intrinsics(width: int, height: int, hfov_deg: float, vfov_deg: f
 
 class Sam3DBodyDirectRunner:
     """Thin wrapper around the vendored official SAM3D Body direct API."""
+    device: str | None = None
+
     def __init__(self, config: dict[str, Any]):
         """Initialize the direct SAM3D runner and cache model configuration."""
         repo = str(config.get("sam3d_repo") or "").strip()
@@ -796,7 +800,7 @@ class Sam3DBodyDirectRunner:
         # CUDA device of this thread. Pin the current device to the one this
         # runner's model was loaded on so multi-GPU runner pools (cuda:1, ...)
         # do not hit cross-device tensor errors, without patching upstream.
-        with sam3d_device_context(torch, self.device), torch.no_grad():
+        with sam3d_device_context(torch, getattr(self, "device", None)), torch.no_grad():
             try:
                 outputs = self.estimator.process_one_image(
                     str(image_path),
@@ -2250,7 +2254,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for multiview fusion and visualization modes."""
     parser = argparse.ArgumentParser(description="360 bbox -> 8 perspective views -> SAM3D Body -> fused 3D kpts")
     parser.add_argument("--video", default=CONFIG["video_path"], help="360 equirectangular video path")
-    parser.add_argument("--bbox-json", default=CONFIG["bbox_json_path"], help="bbox JSON from cotracker_person_tracking.py")
+    parser.add_argument("--bbox-json", default=CONFIG["bbox_json_path"], help="bbox JSON from cotracker_person_tracking_yolo.py or cotracker_selfie_bbox_tracking_yolo.py")
     parser.add_argument("--output-dir", default=CONFIG["output_dir"], help="output directory")
     parser.add_argument("--frame-number", type=int, default=None, help="only process this 1-based frame number; omit to process all frames")
     parser.add_argument("--track-id", type=int, default=None, help="only process this track id")

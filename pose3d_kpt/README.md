@@ -19,8 +19,8 @@ The method:
 - `cotracker_person_tracking_yolo.py`: YOLO detection, pose/grid query generation, CoTracker propagation, bbox reconstruction, and track ID association.
 - `sam3d_body_multiview_fusion.py`: equirectangular-to-perspective rendering, projected bbox generation, SAM3D Body execution, camera-to-world transform, and multiview 3D keypoint fusion.
 - `framewise_person_detection.py`: frame-by-frame baseline detection.
-- `test_360_detection.py`: 360 cubemap detection utilities and experiments.
-- `vlm_video_analyze.py`: VLM-based video frame analysis.
+- `cubemap_detection.py`: 360 cubemap/sliding-window YOLO detection utilities used by the tracking scripts.
+- `vlm_person_detection.py`: VLM-based (Qwen-VL) person detection experiment.
 
 ## Project Layout
 
