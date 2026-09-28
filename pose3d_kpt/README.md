@@ -26,8 +26,9 @@ The method:
 
 This module is organized around two stages: tracking people in 360 videos, then
 creating pseudo-multiview views for SAM3D Body and fused 3D pose output. The
-original root-level scripts remain compatible entry points while the package
-layout grows around those stages.
+implementation lives in the root-level scripts; the small `posefusion360`
+package only provides project paths and console-script entry points that
+dispatch to those scripts.
 
 ```text
 pose3d_kpt/
@@ -37,26 +38,25 @@ pose3d_kpt/
 |   `-- paths.example.yaml
 |-- scripts/
 |   |-- run_tracking.py
+|   |-- run_yolo_tracking.py
 |   |-- run_multiview_fusion.py
 |   |-- run_direct_360_compare.py
-|   `-- run_full_pipeline.py
+|   |-- run_full_pipeline.py
+|   `-- cleanup_multiview_duplicates.py
 |-- src/posefusion360/
-|   |-- io/               # video, tracking JSON, and output layout helpers
-|   |-- geometry/         # spherical, perspective, and camera/world math
-|   |-- tracking/         # stage 1: YOLO/CoTracker person tracking
-|   |-- multiview/        # stage 2: virtual views and world-space fusion
-|   |-- sam3d/            # SAM3D Body runner and result payload handling
-|   |-- visualization/    # frame/world/summary visualizations
-|   `-- pipelines/        # tracking, multiview, and full-pipeline entry points
+|   |-- project.py        # repo/project root helpers
+|   |-- legacy.py         # loads and runs the root-level scripts by name
+|   `-- pipelines/        # tracking, multiview, direct-360, and full-pipeline entry points
 |-- tests/
-|-- third_party/
+|-- third_party/sam-3d-body   # git submodule (official upstream)
+|-- cubemap_detection.py
+|-- cotracker_person_tracking_yolo.py
+|-- cotracker_selfie_bbox_tracking_yolo.py
+|-- framewise_person_detection.py
 |-- sam3d_body_multiview_fusion.py
 |-- sam3d_body_360_direct_compare.py
-`-- cotracker_person_tracking_yolo.py
+`-- vlm_person_detection.py
 ```
-
-The current package wrappers call the legacy scripts internally, so existing
-commands keep working while newer code can import from `posefusion360`.
 
 ## Example Commands
 

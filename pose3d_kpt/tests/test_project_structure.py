@@ -30,16 +30,9 @@ def test_pipeline_wrappers_are_importable() -> None:
     assert callable(yolo_tracking.main)
 
 
-def test_two_stage_project_modules_are_importable() -> None:
-    from posefusion360 import geometry, io, multiview, sam3d, tracking, visualization
+def test_two_stage_pipeline_entry_points_are_importable() -> None:
     from posefusion360.pipelines import full_pipeline, tracking as tracking_pipeline
 
-    assert tracking.__doc__
-    assert multiview.__doc__
-    assert sam3d.__doc__
-    assert visualization.__doc__
-    assert geometry.__doc__
-    assert io.__doc__
     assert callable(tracking_pipeline.main)
     assert callable(full_pipeline.main)
 
@@ -55,5 +48,5 @@ def test_project_configs_exist() -> None:
 if __name__ == "__main__":
     test_package_exposes_project_paths()
     test_pipeline_wrappers_are_importable()
-    test_two_stage_project_modules_are_importable()
+    test_two_stage_pipeline_entry_points_are_importable()
     test_project_configs_exist()
